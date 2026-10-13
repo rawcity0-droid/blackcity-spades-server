@@ -1,0 +1,1 @@
+{"dependencies":{"ws":"^8.18.0"},"description":"Multiplayer Spades game server for Raw City Spades (Node.js + WebSockets)","main":"server.js","name":"raw-city-spades-server","scripts":{"start":"node server.js","test":"node test-client.js"},"version":"1.0.0"}
