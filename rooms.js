@@ -279,6 +279,8 @@ class TournamentManager {
       name: String(hostName || 'Tournament').trim().slice(0, 32) || 'Tournament',
       tables, // [{ tableIndex, code }]
       lobby: [], // [{ name, ws }] — waiting to be seated
+      waitlist: [], // [{ name, ws, avatar }] — overflow, seated as spots open
+      seatingDone: false,
       hostName: cleanName(hostName),
       createdAt: Date.now(),
     };
@@ -293,16 +295,87 @@ class TournamentManager {
   joinLobby(code, name) {
     const t = this.getTournament(code);
     const entry = { name: cleanName(name), ws: null };
+    // Once seating has happened and every table is full, newcomers wait in line.
+    if (t.mode !== 'bracket' && t.seatingDone && !this._freeTournamentSeat(t)) {
+      t.waitlist.push(entry);
+      return { tournament: t, waitlistEntry: entry, position: t.waitlist.length };
+    }
     t.lobby.push(entry);
     return { tournament: t, entry };
   }
 
-  /** Remove a lobby entry (on disconnect). */
+  /** Remove a lobby/waitlist entry (on disconnect). */
   leaveLobby(code, entry) {
     const t = this.tournaments.get(String(code || '').toUpperCase());
     if (!t || !entry) return;
-    const i = t.lobby.indexOf(entry);
+    let i = t.lobby.indexOf(entry);
     if (i >= 0) t.lobby.splice(i, 1);
+    if (t.waitlist) {
+      i = t.waitlist.indexOf(entry);
+      if (i >= 0) t.waitlist.splice(i, 1);
+    }
+  }
+
+  /** First free seat across the tournament's lobby-phase tables, or null. */
+  _freeTournamentSeat(t) {
+    for (const tbl of t.tables) {
+      let room;
+      try { room = this.roomManager.getRoom(tbl.code); } catch { continue; }
+      if (room.phase !== 'lobby') continue;
+      const seat = room.seats.findIndex(s => s === null);
+      if (seat >= 0) return { room, seat };
+    }
+    return null;
+  }
+
+  /**
+   * Seat the first waiting-list player at the first free seat.
+   * Returns { entry, player, tableCode, seat, token } or null.
+   */
+  promoteFromWaitlist(code) {
+    const t = this.getTournament(code);
+    if (!t.waitlist || !t.waitlist.length) return null;
+    const spot = this._freeTournamentSeat(t);
+    if (!spot) return null;
+    const entry = t.waitlist.shift();
+    const player = {
+      token: makeToken(),
+      name: entry.name,
+      seat: spot.seat,
+      connected: false, // they claim it via their token next
+      disconnectTimer: null,
+      ws: null,
+      avatar: entry.avatar || null,
+    };
+    spot.room.seats[spot.seat] = player;
+    if (spot.room.hostSeat < 0 || !spot.room.seats[spot.room.hostSeat]) {
+      spot.room.hostSeat = spot.seat;
+    }
+    return { entry, player, tableCode: spot.room.code, seat: spot.seat, token: player.token };
+  }
+
+  /**
+   * Voluntarily free a player's seat (leave_table). Aborts a live game,
+   * following the same rule as a disconnect timeout.
+   * Returns { room, abortedGame }.
+   */
+  freeSeat(room, player) {
+    const wasHost = player.seat === room.hostSeat;
+    this.roomManager._clearTimer(player);
+    room.seats[player.seat] = null;
+    let abortedGame = false;
+    if (room.phase === 'playing') {
+      room.engine = null;
+      room.phase = 'lobby';
+      abortedGame = true;
+    }
+    if (wasHost) {
+      room.hostSeat = room.seats.findIndex(p => p !== null);
+    }
+    if (room.seats.every(s => s === null)) {
+      this.roomManager.rooms.delete(room.code);
+    }
+    return { room, abortedGame };
   }
 
   /**
@@ -339,6 +412,10 @@ class TournamentManager {
     }
     // Remove seated players from the lobby.
     t.lobby = t.lobby.filter(e => !e.assigned);
+    t.seatingDone = true;
+    // Anyone who didn't fit becomes the waiting list, in join order.
+    for (const entry of t.lobby) t.waitlist.push(entry);
+    t.lobby.length = 0;
     return seated;
   }
 
@@ -573,6 +650,8 @@ class TournamentManager {
       name: t.name,
       hostName: t.hostName,
       lobby: t.lobby.map(e => ({ name: e.name })),
+      waitlist: (t.waitlist || []).map(e => ({ name: e.name })),
+      seatingDone: !!t.seatingDone,
       tables: t.tables.map(tbl => {
         const room = this.roomManager.getRoom(tbl.code);
         return {
