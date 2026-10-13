@@ -320,6 +320,37 @@ class SpadesEngine {
       winner: this.winner,
     };
   }
+
+  /**
+   * Spectator view — everything a seated player sees EXCEPT any hands.
+   * Used for tournament audience/stream displays. Never reveals cards.
+   */
+  getSpectatorView() {
+    const teamTricks = [0, 1].map(t =>
+      this.teams[t].reduce((s, st) => s + (this.tricksWon ? this.tricksWon[st] : 0), 0));
+    return {
+      phase: this.phase,
+      handNumber: this.handNumber,
+      dealer: this.dealer ?? null,
+      turn: this.turn ?? null,
+      teams: this.teams.map(t => t.slice()),
+      options: { ...this.options },
+      bids: this.bids ? this.bids.slice() : null,
+      teamTricks,
+      scores: this.scores.slice(),
+      bags: this.bags.slice(),
+      spadesBroken: this.spadesBroken || false,
+      trickNumber: this.trickNumber || 0,
+      currentTrick: (this.currentTrick || []).map(t => ({ seat: t.seat, card: cardId(t.card) })),
+      spectator: true,
+      mySeat: -1,
+      myTeam: -1,
+      myHand: [],
+      myBid: null,
+      handScores: this.handScores,
+      winner: this.winner,
+    };
+  }
 }
 
 module.exports = { SpadesEngine, EngineError, cardId, parseCardId, SUITS, RANKS, validateOptions };
