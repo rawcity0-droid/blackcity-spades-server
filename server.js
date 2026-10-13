@@ -159,6 +159,27 @@ function handleEngineEvents(room, events) {
         winnerTeam: e.winnerTeam,
         scores: e.scores,
       });
+      // Bracket tournaments: advance the winning team automatically.
+      if (room.bracketTournamentCode && room.bracketMatchId) {
+        try {
+          const result = tournaments.recordBracketWin(
+            room.bracketTournamentCode, room.code, e.winnerTeam);
+          for (const n of result.notifications) {
+            if (n.ws) {
+              send(n.ws, {
+                type: 'tournament_seated',
+                tournamentCode: room.bracketTournamentCode,
+                tableCode: n.tableCode,
+                seat: n.seat,
+                token: n.token,
+                bracketAdvance: true,
+              });
+            }
+          }
+          broadcastTournament(result.tournament,
+            tournaments.tournamentState(room.bracketTournamentCode));
+        } catch (err) { /* bracket bookkeeping must never crash the game */ }
+      }
     }
     // 'bid_made' / 'card_played' / 'bidding_done' are covered by game_state.
   }
@@ -381,6 +402,63 @@ async function route(ws, msg) {
       const tbl = tournament.tables[idx];
       if (!tbl) throw new RoomError('No such table');
       const room = manager.getRoom(tbl.code);
+      manager.forceStartGame(room);
+      handleEngineEvents(room, []);
+      broadcastTournament(tournament, tournaments.tournamentState(tcode));
+      return;
+    }
+
+    case 'create_bracket': {
+      // Premium host creates a single-elimination bracket (4, 8, or 16 players).
+      if (typeof msg.name !== 'string' || !msg.name.trim()) {
+        throw new RoomError('create_bracket needs a "name"');
+      }
+      const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
+      await requirePremium(playerId);
+      const { tournament } = tournaments.createBracket(
+        msg.name, msg.playerCount, msg.options);
+      const entry = { name: String(msg.name).trim().slice(0, 20), ws };
+      tournament.lobby.push(entry);
+      clients.set(ws, { tournament, lobbyEntry: entry });
+      send(ws, {
+        type: 'bracket_created',
+        tournamentCode: tournament.code,
+        tournamentName: tournament.name,
+        bracketSize: tournament.bracketSize,
+      });
+      send(ws, tournaments.tournamentState(tournament.code));
+      return;
+    }
+
+    case 'bracket_start': {
+      // Host starts Round 1: lobby players are seated into bracket matches.
+      const tcode = typeof msg.tournamentCode === 'string' ? msg.tournamentCode : '';
+      const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
+      await requirePremium(playerId);
+      const { tournament, notifications } = tournaments.startBracket(tcode);
+      for (const n of notifications) {
+        if (n.ws) {
+          send(n.ws, {
+            type: 'tournament_seated',
+            tournamentCode: tcode,
+            tableCode: n.tableCode,
+            seat: n.seat,
+            token: n.token,
+          });
+        }
+      }
+      broadcastTournament(tournament, tournaments.tournamentState(tcode));
+      return;
+    }
+
+    case 'bracket_start_table': {
+      // Host starts the game on one bracket table (by table code).
+      const tcode = typeof msg.tournamentCode === 'string' ? msg.tournamentCode : '';
+      const tableCode = typeof msg.tableCode === 'string' ? msg.tableCode : '';
+      const tournament = tournaments.getTournament(tcode);
+      const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
+      await requirePremium(playerId);
+      const room = manager.getRoom(tableCode);
       manager.forceStartGame(room);
       handleEngineEvents(room, []);
       broadcastTournament(tournament, tournaments.tournamentState(tcode));
