@@ -69,16 +69,16 @@ function httpPost(path, body) {
   await new Promise(r => setTimeout(r, 400));
 
   // 1. Free room with defaults works.
-  const free = await wsCall({ type: 'create_room', name: 'Free', playerId: 'pid-free-1' });
+  const free = await wsCall({ type: 'create_room', name: 'Free', playerId: 'free1@example.com' });
   check('free create_room with defaults works', free.type === 'room_state', free.type);
 
   // 2. Custom options rejected.
-  const custom = await wsCall({ type: 'create_room', name: 'Custom', playerId: 'pid-free-2', options: { targetScore: 250 } });
+  const custom = await wsCall({ type: 'create_room', name: 'Custom', playerId: 'free2@example.com', options: { targetScore: 250 } });
   check('custom options rejected for non-subscriber',
     custom.type === 'error' && /(premium|not configured)/i.test(custom.message), custom.message);
 
   // 3. Private room rejected.
-  const priv = await wsCall({ type: 'create_room', name: 'Priv', playerId: 'pid-free-3', options: { private: true } });
+  const priv = await wsCall({ type: 'create_room', name: 'Priv', playerId: 'free3@example.com', options: { private: true } });
   check('private room rejected for non-subscriber',
     priv.type === 'error' && /(premium|not configured)/i.test(priv.message), priv.message);
 
@@ -87,7 +87,7 @@ function httpPost(path, body) {
     const ws = new WebSocket(`ws://localhost:${PORT}`);
     const timer = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 8000);
     let roomed = false;
-    ws.on('open', () => ws.send(JSON.stringify({ type: 'create_room', name: 'Host', playerId: 'pid-free-4' })));
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'create_room', name: 'Host', playerId: 'free4@example.com' })));
     ws.on('message', (raw) => {
       const m = JSON.parse(raw.toString());
       if (m.type === 'room_state' && !roomed) {
@@ -103,11 +103,11 @@ function httpPost(path, body) {
     /(premium|not configured)/i.test(teamsResult.message), teamsResult.message);
 
   // 5. REST: status false.
-  const st = await httpGet('/api/subscription-status?playerId=pid-free-1');
+  const st = await httpGet('/api/subscription-status?email=free1@example.com');
   check('subscription-status false without key', st.status === 200 && st.body.subscribed === false, JSON.stringify(st.body));
 
   // 6. REST: create-checkout 503 without key.
-  const co = await httpPost('/api/create-checkout', { playerId: 'x' });
+  const co = await httpPost('/api/create-checkout', { playerName: 'X', email: 'x@example.com' });
   check('create-checkout 503 without key', co.status === 503, `status=${co.status}`);
 
   console.log(`\n${passed}/${passed + failed} subscription gating checks passed`);
