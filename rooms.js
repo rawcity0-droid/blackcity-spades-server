@@ -326,6 +326,7 @@ class TournamentManager {
             connected: false, // they claim it via their token next
             disconnectTimer: null,
             ws: null,
+            avatar: entry.avatar || null,
           };
           room.seats[seat] = player;
           entry.assigned = { tableCode: room.code, seat, token: player.token };
@@ -389,7 +390,7 @@ class TournamentManager {
   }
 
   /** Make a seat-claim player object (same shape as seatPlayers). */
-  _bracketSeat(name, seat) {
+  _bracketSeat(name, seat, avatar) {
     return {
       token: makeToken(),
       name,
@@ -397,6 +398,7 @@ class TournamentManager {
       connected: false, // claimed via token next
       disconnectTimer: null,
       ws: null,
+      avatar: avatar || null,
     };
   }
 
@@ -431,7 +433,7 @@ class TournamentManager {
       const seatMap = [0, 2, 1, 3];
       ordered.forEach((entry, i) => {
         const seat = seatMap[i];
-        const player = this._bracketSeat(entry.name, seat);
+        const player = this._bracketSeat(entry.name, seat, entry.avatar);
         room.seats[seat] = player;
         notifications.push({ ws: entry.ws, name: entry.name, tableCode: room.code, seat, token: player.token });
       });
@@ -460,7 +462,7 @@ class TournamentManager {
     try {
       const room = this.roomManager.getRoom(tableCode);
       allPlayers = room.seats
-        .map((p, s) => (p ? { name: p.name, ws: p.ws, seat: s } : null))
+        .map((p, s) => (p ? { name: p.name, ws: p.ws, seat: s, avatar: p.avatar || null } : null))
         .filter(Boolean);
     } catch { /* room gone */ }
     const winnerSlot = winnerTeam === 0 ? 'A' : 'B';
@@ -497,7 +499,7 @@ class TournamentManager {
             (nextMatch[teamSlot + 'Ws'] || []).forEach((w, idx) => {
               const seat = seats[idx];
               if (seat === undefined) return;
-              const player = this._bracketSeat(w.name, seat);
+              const player = this._bracketSeat(w.name, seat, w.avatar);
               room.seats[seat] = player;
               notifications.push({ ws: w.ws, name: w.name, tableCode: room.code,
                 seat, token: player.token, bracketAdvance: true });
@@ -518,7 +520,7 @@ class TournamentManager {
       match.tableCode = room.code;
       // match stays 'playing'; winner stays null until series decided
       for (const p of allPlayers) {
-        const player = this._bracketSeat(p.name, p.seat);
+        const player = this._bracketSeat(p.name, p.seat, p.avatar);
         room.seats[p.seat] = player;
         notifications.push({ ws: p.ws, name: p.name, tableCode: room.code,
           seat: p.seat, token: player.token,
