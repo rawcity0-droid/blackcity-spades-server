@@ -6,9 +6,11 @@
  * Server-authoritative subscription checks. No webhooks: the server verifies
  * checkout sessions and subscription status on demand through the Stripe API.
  *
- * Player identity is the client-generated playerId (a UUID kept in the
- * player's browser). Anyone who knows a playerId could claim it, but UUIDs
- * are unguessable — good enough until real accounts exist.
+ * Player identity is the subscriber's email address (lowercased). The static
+ * game client cannot persist storage across reloads, so the email — which the
+ * player knows — is the reproducible key. The server persists the
+ * email -> subscription mapping in subs.json and re-verifies with Stripe
+ * at most once a day.
  *
  * Needs STRIPE_SECRET_KEY in the environment. Without it, checkout creation
  * is unavailable and every premium check fails closed with a clear error.
@@ -28,7 +30,7 @@ const STORE_PATH = path.join(__dirname, 'subs.json');
 const REVERIFY_MS = 24 * 60 * 60 * 1000; // re-check with Stripe daily
 const ACTIVE_STATUSES = new Set(['active', 'trialing']);
 
-let store = {}; // playerId -> { subscriptionId, verifiedAt }
+let store = {}; // email -> { subscriptionId, verifiedAt }
 try {
   store = JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')) || {};
 } catch {
@@ -87,86 +89,94 @@ function stripeRequest(method, apiPath, params) {
   });
 }
 
-function cleanPlayerId(id) {
-  const s = String(id || '').trim().slice(0, 64);
-  if (!s) throw new Error('playerId is required');
+function cleanEmail(email) {
+  const s = String(email || '').trim().toLowerCase().slice(0, 120);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) throw new Error('a valid email is required');
   return s;
 }
 
 /** Create a subscription Checkout Session; returns the hosted URL. */
-async function createCheckoutSession(playerId, playerName) {
-  const pid = cleanPlayerId(playerId);
+async function createCheckoutSession(playerName, email) {
+  const em = cleanEmail(email);
   const session = await stripeRequest('POST', '/v1/checkout/sessions', {
     'mode': 'subscription',
     'line_items[0][price]': PRICE_ID,
     'line_items[0][quantity]': '1',
     'success_url': SUCCESS_URL,
     'cancel_url': CANCEL_URL,
-    'client_reference_id': pid,
-    'metadata[player_id]': pid,
-    'subscription_data[metadata][player_id]': pid,
+    'customer_email': em,
+    'client_reference_id': em,
+    'metadata[player_email]': em,
+    'metadata[player_name]': String(playerName || '').slice(0, 60),
+    'subscription_data[metadata][player_email]': em,
   });
   if (!session.url) throw new Error('Stripe did not return a checkout URL');
   return session.url;
 }
 
-/** Verify a completed checkout session and record the subscription. */
-async function verifySession(sessionId, playerId) {
-  const pid = cleanPlayerId(playerId);
+/** Verify a completed checkout session; returns the subscriber email or null. */
+async function verifySession(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid.startsWith('cs_')) throw new Error('Invalid checkout session');
   const session = await stripeRequest('GET', '/v1/checkout/sessions/' + encodeURIComponent(sid), {});
-  if (session.payment_status !== 'paid') return false;
-  if (session.client_reference_id !== pid &&
-      !(session.metadata && session.metadata.player_id === pid)) {
-    return false; // session belongs to a different player
-  }
+  if (session.payment_status !== 'paid') return null;
   const subId = typeof session.subscription === 'string'
     ? session.subscription
     : (session.subscription && session.subscription.id);
-  if (!subId) return false;
+  if (!subId) return null;
   const sub = await stripeRequest('GET', '/v1/subscriptions/' + encodeURIComponent(subId), {});
-  if (!ACTIVE_STATUSES.has(sub.status)) return false;
-  store[pid] = { subscriptionId: sub.id, verifiedAt: Date.now() };
+  if (!ACTIVE_STATUSES.has(sub.status)) return null;
+  const email = cleanEmail(
+    (sub.metadata && sub.metadata.player_email) ||
+    (session.metadata && session.metadata.player_email) ||
+    session.customer_email || session.customer_details?.email);
+  store[email] = { subscriptionId: sub.id, verifiedAt: Date.now() };
   saveStore();
-  return true;
+  return email;
 }
 
-/** Search Stripe for an active subscription carrying this playerId. */
-async function findActiveSubscription(pid) {
-  const res = await stripeRequest('GET', '/v1/subscriptions/search', {
-    query: `metadata['player_id']:'${pid}'`,
-    limit: '5',
+/** Find an active subscription for a customer email via the Stripe API. */
+async function findActiveSubscription(email) {
+  const customers = await stripeRequest('GET', '/v1/customers/search', {
+    query: `email:'${email.replace(/'/g, "\\'")}'`,
+    limit: '3',
   });
-  for (const sub of (res.data || [])) {
-    if (ACTIVE_STATUSES.has(sub.status)) return sub;
+  for (const cus of (customers.data || [])) {
+    const subs = await stripeRequest('GET', '/v1/subscriptions', {
+      customer: cus.id,
+      status: 'active',
+      limit: '5',
+    });
+    for (const sub of (subs.data || [])) {
+      if (ACTIVE_STATUSES.has(sub.status)) return { sub, email };
+    }
   }
   return null;
 }
 
-async function refreshFromStripe(pid, hadRecord) {
-  const rec = store[pid];
+async function refreshFromStripe(email, hadRecord) {
+  const rec = store[email];
   try {
     if (rec && rec.subscriptionId) {
       const sub = await stripeRequest(
         'GET', '/v1/subscriptions/' + encodeURIComponent(rec.subscriptionId), {});
       const ok = ACTIVE_STATUSES.has(sub.status);
       if (ok) {
-        store[pid] = { subscriptionId: sub.id, verifiedAt: Date.now() };
+        store[email] = { subscriptionId: sub.id, verifiedAt: Date.now() };
         saveStore();
       } else {
-        delete store[pid];
+        delete store[email];
         saveStore();
       }
       return ok;
     }
-    const sub = await findActiveSubscription(pid);
-    if (sub) {
-      store[pid] = { subscriptionId: sub.id, verifiedAt: Date.now() };
+    const found = await findActiveSubscription(email);
+    if (found) {
+      store[email] = { subscriptionId: found.sub.id, verifiedAt: Date.now() };
       saveStore();
       return true;
     }
-    if (rec) { delete store[pid]; saveStore(); }
+    if (rec) { delete store[email]; saveStore(); }
     return false;
   } catch (err) {
     console.error('subs: Stripe check failed:', err.message);
@@ -176,14 +186,14 @@ async function refreshFromStripe(pid, hadRecord) {
 }
 
 /** The authoritative premium check. Fails closed without a key. */
-async function isSubscribed(playerId) {
+async function isSubscribed(email) {
   if (process.env.SUBS_BYPASS === '1') return true; // automated tests only
-  let pid;
-  try { pid = cleanPlayerId(playerId); } catch { return false; }
+  let em;
+  try { em = cleanEmail(email); } catch { return false; }
   if (!secretKey()) return false;
-  const rec = store[pid];
+  const rec = store[em];
   if (rec && (Date.now() - rec.verifiedAt) < REVERIFY_MS) return true;
-  return refreshFromStripe(pid, !!rec);
+  return refreshFromStripe(em, !!rec);
 }
 
 function subscriptionsConfigured() {
