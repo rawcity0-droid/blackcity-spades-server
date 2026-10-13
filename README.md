@@ -56,3 +56,24 @@ Defaults: `{ targetScore: 500, spadesMustBreak: true, sandbags: true }`
 
 Unknown option fields are ignored, so older clients keep working. Invalid
 values get a clear `error` message and the room is not created.
+
+## Subscriptions (Blackcity Spades Premium — $1.99/mo)
+
+Premium unlocks private tables, chosen teams, and custom house rules.
+Free players create public tables with default options (500 / spades must
+break / sandbags on) and default teams (0&2 vs 1&3).
+
+Environment:
+- `STRIPE_SECRET_KEY` — Stripe secret key (test or live). Without it, the
+  subscription endpoints are disabled and premium checks fail closed.
+- `STRIPE_PRICE_ID` — override (default: the $1.99/mo price).
+- `SUBSCRIBE_SUCCESS_URL` / `SUBSCRIBE_CANCEL_URL` — checkout redirects.
+
+REST:
+- `POST /api/create-checkout { playerId, playerName }` -> `{ url }`
+- `POST /api/verify-session { sessionId, playerId }` -> `{ subscribed }`
+- `GET /api/subscription-status?playerId=` -> `{ subscribed }`
+
+No webhooks: the server verifies checkout sessions and subscription status
+on demand via the Stripe API. Tests: `node test-client.js` (game logic,
+run with `SUBS_BYPASS=1`), `node test-subs.js` (gating, no key needed).
