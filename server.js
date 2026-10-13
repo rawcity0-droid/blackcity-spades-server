@@ -376,11 +376,19 @@ async function route(ws, msg) {
       }
       // Tournament play is Premium-only.
       await requirePremium(typeof msg.playerId === 'string' ? msg.playerId : '');
-      const { tournament, entry } = tournaments.joinLobby(msg.tournamentCode, msg.name);
-      entry.ws = ws;
+      const { tournament, entry, waitlistEntry, position } = tournaments.joinLobby(msg.tournamentCode, msg.name);
+      const myEntry = waitlistEntry || entry;
+      myEntry.ws = ws;
       const lobbyAvatar = cleanAvatar(msg.avatar);
-      if (lobbyAvatar) entry.avatar = lobbyAvatar;
-      clients.set(ws, { tournament, lobbyEntry: entry });
+      if (lobbyAvatar) myEntry.avatar = lobbyAvatar;
+      clients.set(ws, { tournament, lobbyEntry: myEntry });
+      if (waitlistEntry) {
+        send(ws, {
+          type: 'tournament_waitlisted',
+          tournamentCode: tournament.code,
+          position,
+        });
+      }
       send(ws, tournaments.tournamentState(tournament.code));
       // Notify the host's table(s) — broadcast to all seated players in tournament.
       broadcastTournament(tournament, tournaments.tournamentState(tournament.code));
@@ -408,6 +416,34 @@ async function route(ws, msg) {
         }
       }
       broadcastTournament(tournament, tournaments.tournamentState(tcode));
+      return;
+    }
+
+    case 'leave_table': {
+      // Voluntary leave. Frees the seat; tournament tables pull from the waitlist.
+      const { room, player } = requireSeat(ctx);
+      const tcode = room.options.tournamentCode;
+      const { abortedGame } = tournaments.freeSeat(room, player);
+      clients.set(ws, {});
+      if (abortedGame) {
+        broadcastAll(room, {
+          type: 'error',
+          message: `${player.name} left — game aborted, room is back in lobby`,
+        });
+      }
+      let promo = null;
+      if (tcode) {
+        try {
+          const t = tournaments.getTournament(tcode);
+          if (t.mode !== 'bracket') {
+            promo = tournaments.promoteFromWaitlist(tcode);
+            if (promo) notifyPromoted(promo, tcode);
+            broadcastTournament(t, tournaments.tournamentState(tcode));
+          }
+        } catch { /* tournament gone */ }
+      }
+      try { broadcastAll(room, roomStateMsg(room)); } catch { /* room gone */ }
+      send(ws, { type: 'left_table', code: room.code });
       return;
     }
 
@@ -492,6 +528,27 @@ async function route(ws, msg) {
 }
 
 /** Send a message to everyone in a tournament (all tables + lobby). */
+/**
+ * Tell a waitlist-promoted player their table + token so their client
+ * can auto-join and claim the seat.
+ */
+function notifyPromoted(promo, tcode) {
+  if (!promo || !promo.entry.ws) return;
+  const ws = promo.entry.ws;
+  try {
+    const room = manager.getRoom(promo.tableCode);
+    clients.set(ws, { room, player: promo.player });
+  } catch { /* room gone */ }
+  send(ws, {
+    type: 'tournament_seated',
+    tournamentCode: tcode,
+    tableCode: promo.tableCode,
+    seat: promo.seat,
+    token: promo.token,
+    fromWaitlist: true,
+  });
+}
+
 function broadcastTournament(tournament, obj) {
   const seen = new Set();
   for (const tbl of tournament.tables) {
@@ -623,14 +680,25 @@ wss.on('connection', (ws) => {
     if (ctx.room && ctx.player) {
       const { room, player } = ctx;
       manager.markDisconnected(room, player, ({ abortedGame }) => {
-        // 60s hold expired.
+        // 60s hold expired — seat is now free.
         if (abortedGame) {
           broadcastAll(room, {
             type: 'error',
             message: `${player.name} timed out — game aborted, room is back in lobby`,
           });
         }
-        broadcastAll(room, roomStateMsg(room));
+        const tcode = room.options.tournamentCode;
+        if (tcode) {
+          try {
+            const t = tournaments.getTournament(tcode);
+            if (t.mode !== 'bracket') {
+              const promo = tournaments.promoteFromWaitlist(tcode);
+              if (promo) notifyPromoted(promo, tcode);
+              broadcastTournament(t, tournaments.tournamentState(tcode));
+            }
+          } catch { /* tournament gone */ }
+        }
+        try { broadcastAll(room, roomStateMsg(room)); } catch { /* room gone */ }
       });
       broadcastAll(room, roomStateMsg(room)); // immediate: show them as disconnected
     }
