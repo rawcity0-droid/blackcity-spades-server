@@ -190,6 +190,10 @@ async function isSubscribed(email) {
   if (process.env.SUBS_BYPASS === '1') return true; // automated tests only
   let em;
   try { em = cleanEmail(email); } catch { return false; }
+  // Game owner(s) always have Premium — comma-separated emails in OWNER_EMAILS.
+  const owners = String(process.env.OWNER_EMAILS || '').split(',')
+    .map(s => s.trim().toLowerCase()).filter(Boolean);
+  if (owners.includes(em)) return true;
   if (!secretKey()) return false;
   const rec = store[em];
   if (rec && (Date.now() - rec.verifiedAt) < REVERIFY_MS) return true;
