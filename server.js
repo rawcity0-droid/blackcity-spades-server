@@ -172,7 +172,10 @@ function handleEngineEvents(room, events) {
                 tableCode: n.tableCode,
                 seat: n.seat,
                 token: n.token,
-                bracketAdvance: true,
+                bracketAdvance: !!n.bracketAdvance,
+                rematch: !!n.rematch,
+                gameNumber: n.gameNumber || 1,
+                seriesScore: n.seriesScore || null,
               });
             }
           }
