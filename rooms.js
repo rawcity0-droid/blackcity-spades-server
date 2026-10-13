@@ -341,9 +341,193 @@ class TournamentManager {
     return seated;
   }
 
+  /**
+   * BRACKET TOURNAMENTS — single elimination.
+   * playerCount: 4, 8, or 16. Each match is a 4-player table (2v2);
+   * the winning TEAM (2 players) advances to the next round.
+   */
+  createBracket(hostName, playerCount, options) {
+    const n = [4, 8, 16].includes(Number(playerCount)) ? Number(playerCount) : 8;
+    const roundNames = n === 4 ? ['Final']
+      : n === 8 ? ['Semifinals', 'Final']
+      : ['Quarterfinals', 'Semifinals', 'Final'];
+    const code = this._makeTournamentCode();
+    const rounds = roundNames.map((name, r) => {
+      const matchCount = Math.pow(2, roundNames.length - 1 - r);
+      return {
+        name,
+        matches: Array.from({ length: matchCount }, (_, m) => ({
+          matchId: `R${r}M${m}`,
+          tableCode: null,
+          teamA: null, // [name1, name2]
+          teamB: null,
+          winner: null, // 'A' | 'B'
+          status: 'waiting', // waiting | playing | done
+        })),
+      };
+    });
+    const tournament = {
+      code,
+      name: `${cleanName(hostName)}'s Bracket`.slice(0, 40) || 'Bracket',
+      mode: 'bracket',
+      bracketSize: n,
+      rounds,
+      tables: [], // { code } — every created table, for broadcastTournament
+      lobby: [], // [{ name, ws }] — waiting to be seated
+      hostName: cleanName(hostName),
+      createdAt: Date.now(),
+      champion: null, // [name1, name2]
+      started: false,
+    };
+    this.tournaments.set(code, tournament);
+    return { tournament };
+  }
+
+  /** Make a seat-claim player object (same shape as seatPlayers). */
+  _bracketSeat(name, seat) {
+    return {
+      token: makeToken(),
+      name,
+      seat,
+      connected: false, // claimed via token next
+      disconnectTimer: null,
+      ws: null,
+    };
+  }
+
+  /**
+   * Host starts the bracket: seat lobby players into Round 1 matches.
+   * Returns { tournament, notifications: [{ ws, name, tableCode, seat, token }] }.
+   */
+  startBracket(code) {
+    const t = this.getTournament(code);
+    if (t.mode !== 'bracket') throw new RoomError('Not a bracket tournament');
+    if (t.started) throw new RoomError('Bracket already started');
+    if (t.lobby.length < t.bracketSize) {
+      throw new RoomError(`Need ${t.bracketSize} players to start (have ${t.lobby.length})`);
+    }
+    t.started = true;
+    const notifications = [];
+    const round0 = t.rounds[0];
+    for (let m = 0; m < round0.matches.length; m++) {
+      const match = round0.matches[m];
+      const group = t.lobby.splice(0, 4);
+      const { room } = this.roomManager.createRoom(
+        `Bracket ${round0.name} ${m + 1}`, { tournamentCode: t.code });
+      room.bracketTournamentCode = t.code;
+      room.bracketMatchId = match.matchId;
+      t.tables.push({ code: room.code });
+      match.tableCode = room.code;
+      match.status = 'playing';
+      // Team A (group[0], group[1]) -> seats 0,2 ; Team B (group[2], group[3]) -> seats 1,3
+      match.teamA = [group[0].name, group[1].name];
+      match.teamB = [group[2].name, group[3].name];
+      const ordered = [group[0], group[1], group[2], group[3]];
+      const seatMap = [0, 2, 1, 3];
+      ordered.forEach((entry, i) => {
+        const seat = seatMap[i];
+        const player = this._bracketSeat(entry.name, seat);
+        room.seats[seat] = player;
+        notifications.push({ ws: entry.ws, name: entry.name, tableCode: room.code, seat, token: player.token });
+      });
+    }
+    return { tournament: t, notifications };
+  }
+
+  /**
+   * Record a completed bracket match and advance the winning team.
+   * Called on match_done. Returns { tournament, notifications, champion }.
+   * notifications: [{ ws, name, tableCode, seat, token }] for advanced players.
+   */
+  recordBracketWin(code, tableCode, winnerTeam) {
+    const t = this.getTournament(code);
+    if (t.mode !== 'bracket') return { tournament: t, notifications: [], champion: t.champion };
+    let match = null, roundIndex = -1;
+    for (let r = 0; r < t.rounds.length; r++) {
+      const found = t.rounds[r].matches.find(mt => mt.tableCode === tableCode);
+      if (found) { match = found; roundIndex = r; break; }
+    }
+    if (!match || match.status === 'done') {
+      return { tournament: t, notifications: [], champion: t.champion };
+    }
+    // Pull the winning players (name + live ws) from the finished room.
+    let winners = [];
+    try {
+      const room = this.roomManager.getRoom(tableCode);
+      const winSeats = winnerTeam === 0 ? [0, 2] : [1, 3];
+      winners = winSeats.map(s => room.seats[s]).filter(Boolean)
+        .map(p => ({ name: p.name, ws: p.ws }));
+    } catch { /* room gone */ }
+    match.status = 'done';
+    match.winner = winnerTeam === 0 ? 'A' : 'B';
+    const notifications = [];
+    const isFinal = roundIndex === t.rounds.length - 1;
+    if (isFinal) {
+      t.champion = winners.map(w => w.name);
+    } else {
+      const m = t.rounds[roundIndex].matches.indexOf(match);
+      const nextMatch = t.rounds[roundIndex + 1].matches[Math.floor(m / 2)];
+      const slot = (m % 2 === 0) ? 'teamA' : 'teamB';
+      nextMatch[slot] = winners.map(w => w.name);
+      // Keep ws refs for seating when the matchup completes.
+      nextMatch[slot + 'Ws'] = winners;
+      if (nextMatch.teamA && nextMatch.teamB) {
+        const nextName = `Bracket ${t.rounds[roundIndex + 1].name} ${Math.floor(m / 2) + 1}`;
+        const { room } = this.roomManager.createRoom(nextName, { tournamentCode: t.code });
+        room.bracketTournamentCode = t.code;
+        room.bracketMatchId = nextMatch.matchId;
+        t.tables.push({ code: room.code });
+        nextMatch.tableCode = room.code;
+        nextMatch.status = 'playing';
+        for (const teamSlot of ['teamA', 'teamB']) {
+          const seats = teamSlot === 'teamA' ? [0, 2] : [1, 3];
+          (nextMatch[teamSlot + 'Ws'] || []).forEach((w, idx) => {
+            const seat = seats[idx];
+            if (seat === undefined) return;
+            const player = this._bracketSeat(w.name, seat);
+            room.seats[seat] = player;
+            notifications.push({ ws: w.ws, name: w.name, tableCode: room.code, seat, token: player.token });
+          });
+        }
+      }
+    }
+    return { tournament: t, notifications, champion: t.champion };
+  }
+
   /** Snapshot of tournament state for host / lobby views. */
   tournamentState(code) {
     const t = this.getTournament(code);
+    const base = {
+      type: 'tournament_state',
+      tournamentCode: t.code,
+      name: t.name,
+      hostName: t.hostName,
+      mode: t.mode || 'tables',
+      lobby: t.lobby.map(e => ({ name: e.name })),
+    };
+    if (t.mode === 'bracket') {
+      base.bracketSize = t.bracketSize;
+      base.champion = t.champion;
+      base.started = !!t.started;
+      base.rounds = t.rounds.map(r => ({
+        name: r.name,
+        matches: r.matches.map(m => ({
+          matchId: m.matchId,
+          tableCode: m.tableCode,
+          teamA: m.teamA ? m.teamA.slice() : null,
+          teamB: m.teamB ? m.teamB.slice() : null,
+          winner: m.winner,
+          status: m.status,
+        })),
+      }));
+      base.tables = t.tables.map(tbl => {
+        try {
+          const room = this.roomManager.getRoom(tbl.code);
+          return { code: room.code, phase: room.phase };
+        } catch { return { code: tbl.code, phase: 'unknown' }; }
+      });
+      return base;
+    }
     return {
       type: 'tournament_state',
       tournamentCode: t.code,
