@@ -46,7 +46,7 @@
 
 const { WebSocketServer } = require('ws');
 const http = require('http');
-const { RoomManager, RoomError } = require('./rooms');
+const { RoomManager, RoomError, TournamentManager } = require('./rooms');
 const { EngineError, cardId } = require('./game');
 const subs = require('./subs');
 
@@ -71,7 +71,8 @@ async function requirePremium(playerId) {
 }
 
 const manager = new RoomManager();
-const clients = new Map(); // ws -> { room, player }
+const tournaments = new TournamentManager(manager);
+const clients = new Map(); // ws -> { room, player } | { spectatorOf, spectator } | { tournament, lobbyEntry }
 
 function send(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj)); // 1 = OPEN
@@ -89,11 +90,26 @@ function broadcast(room, obj) {
   }
 }
 
+/** Broadcast to seated players AND spectators (results, room state). */
+function broadcastAll(room, obj) {
+  broadcast(room, obj);
+  for (const s of room.spectators) {
+    if (s.ws) send(s.ws, obj);
+  }
+}
+
 /** Personalized game state per player — each sees only their own hand. */
 function broadcastGameState(room) {
   for (const p of room.seats) {
     if (p && p.ws && room.engine) {
       send(p.ws, { type: 'game_state', state: room.engine.getView(p.seat) });
+    }
+  }
+  // Spectators get the masked view — never any hands.
+  if (room.engine) {
+    const spec = { type: 'game_state', state: room.engine.getSpectatorView() };
+    for (const s of room.spectators) {
+      if (s.ws) send(s.ws, spec);
     }
   }
 }
@@ -122,7 +138,7 @@ function requireSeat(ctx) {
 function handleEngineEvents(room, events) {
   for (const e of events) {
     if (e.type === 'trick_done') {
-      broadcast(room, {
+      broadcastAll(room, {
         type: 'trick_result',
         trickNumber: e.trickNumber,
         cards: e.cards,
@@ -130,7 +146,7 @@ function handleEngineEvents(room, events) {
       });
     } else if (e.type === 'hand_done') {
       room.phase = 'hand_done';
-      broadcast(room, {
+      broadcastAll(room, {
         type: 'hand_result',
         detail: e.detail,
         scores: e.scores,
@@ -138,7 +154,7 @@ function handleEngineEvents(room, events) {
       });
     } else if (e.type === 'match_done') {
       room.phase = 'match_done';
-      broadcast(room, {
+      broadcastAll(room, {
         type: 'match_result',
         winnerTeam: e.winnerTeam,
         scores: e.scores,
@@ -249,8 +265,127 @@ async function route(ws, msg) {
       return;
     }
 
+    case 'spectate_room': {
+      // Watch-only: sees the table, never any hands. For tournament streams.
+      if (typeof msg.code !== 'string' || typeof msg.name !== 'string') {
+        throw new RoomError('spectate_room needs "code" and "name"');
+      }
+      const { room, spectator } = manager.addSpectator(msg.code, msg.name);
+      spectator.ws = ws;
+      clients.set(ws, { spectatorOf: room, spectator });
+      send(ws, {
+        type: 'spectate_joined',
+        code: room.code,
+        spectator: true,
+        ...roomStateMsg(room),
+      });
+      if (room.phase === 'playing' && room.engine) {
+        send(ws, { type: 'game_state', state: room.engine.getSpectatorView() });
+      }
+      return;
+    }
+
+    case 'create_tournament': {
+      // Premium host creates a tournament with 1-8 tables.
+      if (typeof msg.name !== 'string' || !msg.name.trim()) {
+        throw new RoomError('create_tournament needs a "name"');
+      }
+      const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
+      await requirePremium(playerId);
+      const { tournament, hostRoom, hostPlayer } =
+        tournaments.createTournament(msg.name, msg.tableCount, msg.options);
+      hostPlayer.ws = ws;
+      hostPlayer.playerId = playerId;
+      clients.set(ws, { room: hostRoom, player: hostPlayer, tournamentHost: tournament.code });
+      send(ws, {
+        type: 'tournament_created',
+        tournamentCode: tournament.code,
+        tournamentName: tournament.name,
+        tables: tournament.tables.map(t => ({ tableIndex: t.tableIndex, code: t.code })),
+        // Host auto-joins table 0.
+        tableCode: hostRoom.code,
+        yourSeat: hostPlayer.seat,
+        yourToken: hostPlayer.token,
+      });
+      send(ws, roomStateMsg(hostRoom));
+      return;
+    }
+
+    case 'join_tournament': {
+      // Player joins the tournament lobby; host seats them next.
+      if (typeof msg.tournamentCode !== 'string' || typeof msg.name !== 'string') {
+        throw new RoomError('join_tournament needs "tournamentCode" and "name"');
+      }
+      const { tournament, entry } = tournaments.joinLobby(msg.tournamentCode, msg.name);
+      entry.ws = ws;
+      clients.set(ws, { tournament, lobbyEntry: entry });
+      send(ws, tournaments.tournamentState(tournament.code));
+      // Notify the host's table(s) — broadcast to all seated players in tournament.
+      broadcastTournament(tournament, tournaments.tournamentState(tournament.code));
+      return;
+    }
+
+    case 'seat_tournament_players': {
+      // Host seats lobby players into tables (4 per table).
+      const tcode = typeof msg.tournamentCode === 'string' ? msg.tournamentCode : '';
+      const tournament = tournaments.getTournament(tcode);
+      const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
+      await requirePremium(playerId);
+      const seated = tournaments.seatPlayers(tcode);
+      // Tell each seated player their table + token so their client
+      // can auto-join the room and claim the seat.
+      for (const s of seated) {
+        if (s.entry.ws) {
+          send(s.entry.ws, {
+            type: 'tournament_seated',
+            tournamentCode: tcode,
+            tableCode: s.tableCode,
+            seat: s.seat,
+            token: s.token,
+          });
+        }
+      }
+      broadcastTournament(tournament, tournaments.tournamentState(tcode));
+      return;
+    }
+
+    case 'tournament_start_table': {
+      // Host starts the game on one tournament table.
+      const tcode = typeof msg.tournamentCode === 'string' ? msg.tournamentCode : '';
+      const tournament = tournaments.getTournament(tcode);
+      const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
+      await requirePremium(playerId);
+      const idx = Math.floor(Number(msg.tableIndex) || 0);
+      const tbl = tournament.tables[idx];
+      if (!tbl) throw new RoomError('No such table');
+      const room = manager.getRoom(tbl.code);
+      manager.forceStartGame(room);
+      handleEngineEvents(room, []);
+      broadcastTournament(tournament, tournaments.tournamentState(tcode));
+      return;
+    }
+
     default:
       throw new RoomError(`Unknown message type: ${msg.type}`);
+  }
+}
+
+/** Send a message to everyone in a tournament (all tables + lobby). */
+function broadcastTournament(tournament, obj) {
+  const seen = new Set();
+  for (const tbl of tournament.tables) {
+    try {
+      const room = manager.getRoom(tbl.code);
+      for (const p of room.seats) {
+        if (p && p.ws && !seen.has(p.ws)) { seen.add(p.ws); send(p.ws, obj); }
+      }
+      for (const s of room.spectators) {
+        if (s.ws && !seen.has(s.ws)) { seen.add(s.ws); send(s.ws, obj); }
+      }
+    } catch { /* table gone */ }
+  }
+  for (const e of tournament.lobby) {
+    if (e.ws && !seen.has(e.ws)) { seen.add(e.ws); send(e.ws, obj); }
   }
 }
 
@@ -350,19 +485,33 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const ctx = clients.get(ws);
     clients.delete(ws);
-    if (ctx && ctx.room && ctx.player) {
+    if (!ctx) return;
+    if (ctx.spectatorOf && ctx.spectator) {
+      // Spectator left — just detach.
+      manager.removeSpectator(ctx.spectatorOf, ctx.spectator);
+      return;
+    }
+    if (ctx.tournament && ctx.lobbyEntry) {
+      // Left the tournament lobby before being seated.
+      tournaments.leaveLobby(ctx.tournament.code, ctx.lobbyEntry);
+      try {
+        broadcastTournament(ctx.tournament, tournaments.tournamentState(ctx.tournament.code));
+      } catch { /* tournament gone */ }
+      return;
+    }
+    if (ctx.room && ctx.player) {
       const { room, player } = ctx;
       manager.markDisconnected(room, player, ({ abortedGame }) => {
         // 60s hold expired.
         if (abortedGame) {
-          broadcast(room, {
+          broadcastAll(room, {
             type: 'error',
             message: `${player.name} timed out — game aborted, room is back in lobby`,
           });
         }
-        broadcast(room, roomStateMsg(room));
+        broadcastAll(room, roomStateMsg(room));
       });
-      broadcast(room, roomStateMsg(room)); // immediate: show them as disconnected
+      broadcastAll(room, roomStateMsg(room)); // immediate: show them as disconnected
     }
   });
 });
