@@ -53,10 +53,12 @@ const subs = require('./subs');
 const PORT = Number(process.env.PORT) || 8080;
 const DEFAULT_OPTIONS = { targetScore: 500, spadesMustBreak: true, sandbags: true };
 
-function isDefaultOptions(o) {
-  return o.targetScore === DEFAULT_OPTIONS.targetScore &&
-    o.spadesMustBreak === DEFAULT_OPTIONS.spadesMustBreak &&
-    o.sandbags === DEFAULT_OPTIONS.sandbags;
+// Free players may choose a target of 250 or 500. Turning spades-must-break
+// off or sandbags off are Premium house rules.
+function isFreeOptions(o) {
+  return (o.targetScore === 250 || o.targetScore === 500) &&
+    o.spadesMustBreak === true &&
+    o.sandbags === true;
 }
 
 function premiumError() {
@@ -176,9 +178,8 @@ async function route(ws, msg) {
       }
       const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
       const wantsPrivate = !!(msg.options && msg.options.private);
-      // Premium is required for private tables or any non-default house rules.
-      let checkOptions = msg.options;
-      if (wantsPrivate || !isDefaultOptions({ ...DEFAULT_OPTIONS, ...(msg.options || {}) })) {
+      // Premium is required for private tables or non-free house rules.
+      if (wantsPrivate || !isFreeOptions({ ...DEFAULT_OPTIONS, ...(msg.options || {}) })) {
         await requirePremium(playerId);
       }
       const { room, player } = manager.createRoom(msg.name, msg.options);
