@@ -24,10 +24,10 @@
  *   bid         { bid }                     -> bid 0-13 (0 = nil) on your turn
  *   play_card   { cardId }                  -> play a card on your turn
  *
- * REST (subscriptions):
- *   POST /api/create-checkout { playerId, playerName } -> { url }
- *   POST /api/verify-session  { sessionId, playerId }  -> { subscribed }
- *   GET  /api/subscription-status?playerId=            -> { subscribed }
+ * REST (subscriptions — identity is the subscriber's email):
+ *   POST /api/create-checkout { playerName, email } -> { url }
+ *   POST /api/verify-session  { sessionId }         -> { subscribed, email }
+ *   GET  /api/subscription-status?email=            -> { subscribed }
  *
  * Server -> client:
  *   room_state   { code, phase, hostSeat, teams, options, seats[], yourToken?, yourSeat? }
@@ -298,16 +298,16 @@ async function handleHttp(req, res) {
       if (!subs.subscriptionsConfigured()) {
         return sendJson(res, 503, { error: 'Subscriptions are not configured on this server yet.' });
       }
-      const checkoutUrl = await subs.createCheckoutSession(body.playerId, body.playerName);
+      const checkoutUrl = await subs.createCheckoutSession(body.playerName, body.email);
       return sendJson(res, 200, { url: checkoutUrl });
     }
     if (req.method === 'POST' && url.pathname === '/api/verify-session') {
       const body = await readJsonBody(req);
-      const ok = await subs.verifySession(body.sessionId, body.playerId);
-      return sendJson(res, 200, { subscribed: ok });
+      const email = await subs.verifySession(body.sessionId);
+      return sendJson(res, 200, { subscribed: !!email, email: email || null });
     }
     if (req.method === 'GET' && url.pathname === '/api/subscription-status') {
-      const ok = await subs.isSubscribed(url.searchParams.get('playerId'));
+      const ok = await subs.isSubscribed(url.searchParams.get('email'));
       return sendJson(res, 200, { subscribed: ok });
     }
     if (req.method === 'GET' && url.pathname === '/') {
