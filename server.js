@@ -6,16 +6,28 @@
  * JSON protocol.
  *
  * Client -> server:
- *   create_room { name, options? }        -> host a room, become seat 0
+ *   create_room { name, playerId?, options? } -> host a room, become seat 0
  *                                          options: {targetScore: 250|500,
  *                                                    spadesMustBreak: bool,
- *                                                    sandbags: bool}
+ *                                                    sandbags: bool,
+ *                                                    private: bool}
  *                                          (validated; unknown fields ignored)
- *   join_room   { code, name, token? }      -> join a seat, or reconnect with token
+ *                                          Premium (subscriber) required when
+ *                                          options differ from defaults or
+ *                                          private is true. Free rooms use
+ *                                          defaults: 500 / break-first / bags on.
+ *   join_room   { code, name, token?, playerId? } -> join a seat, or reconnect
  *   set_teams   { teams }                   -> host sets partnerships (lobby only)
+ *                                          Premium required (free hosts keep
+ *                                          the default 0&2 vs 1&3).
  *   start_game  {}                          -> host starts match / next hand / rematch
  *   bid         { bid }                     -> bid 0-13 (0 = nil) on your turn
  *   play_card   { cardId }                  -> play a card on your turn
+ *
+ * REST (subscriptions):
+ *   POST /api/create-checkout { playerId, playerName } -> { url }
+ *   POST /api/verify-session  { sessionId, playerId }  -> { subscribed }
+ *   GET  /api/subscription-status?playerId=            -> { subscribed }
  *
  * Server -> client:
  *   room_state   { code, phase, hostSeat, teams, options, seats[], yourToken?, yourSeat? }
@@ -33,10 +45,30 @@
  */
 
 const { WebSocketServer } = require('ws');
+const http = require('http');
 const { RoomManager, RoomError } = require('./rooms');
 const { EngineError, cardId } = require('./game');
+const subs = require('./subs');
 
 const PORT = Number(process.env.PORT) || 8080;
+const DEFAULT_OPTIONS = { targetScore: 500, spadesMustBreak: true, sandbags: true };
+
+function isDefaultOptions(o) {
+  return o.targetScore === DEFAULT_OPTIONS.targetScore &&
+    o.spadesMustBreak === DEFAULT_OPTIONS.spadesMustBreak &&
+    o.sandbags === DEFAULT_OPTIONS.sandbags;
+}
+
+function premiumError() {
+  return new RoomError('That is a Premium feature — subscribe for $1.99/mo to unlock private tables, chosen teams, and custom house rules.');
+}
+
+async function requirePremium(playerId) {
+  if (!subs.subscriptionsConfigured()) {
+    throw new RoomError('Subscriptions are not configured on this server yet.');
+  }
+  if (!(await subs.isSubscribed(playerId))) throw premiumError();
+}
 
 const manager = new RoomManager();
 const clients = new Map(); // ws -> { room, player }
@@ -74,6 +106,7 @@ function roomStateMsg(room) {
     hostSeat: room.hostSeat,
     teams: room.teams.map(t => t.slice()),
     options: { ...room.options },
+    isPrivate: !!room.isPrivate,
     seats: room.seats.map(p => (p
       ? { seat: p.seat, name: p.name, connected: p.connected }
       : null)),
@@ -130,7 +163,7 @@ function handleEngineEvents(room, events) {
   }
 }
 
-function route(ws, msg) {
+async function route(ws, msg) {
   if (!msg || typeof msg.type !== 'string') {
     throw new RoomError('Message needs a "type" field');
   }
@@ -141,8 +174,17 @@ function route(ws, msg) {
       if (typeof msg.name !== 'string' || !msg.name.trim()) {
         throw new RoomError('create_room needs a "name"');
       }
+      const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
+      const wantsPrivate = !!(msg.options && msg.options.private);
+      // Premium is required for private tables or any non-default house rules.
+      let checkOptions = msg.options;
+      if (wantsPrivate || !isDefaultOptions({ ...DEFAULT_OPTIONS, ...(msg.options || {}) })) {
+        await requirePremium(playerId);
+      }
       const { room, player } = manager.createRoom(msg.name, msg.options);
+      room.isPrivate = wantsPrivate;
       player.ws = ws;
+      player.playerId = playerId;
       clients.set(ws, { room, player });
       send(ws, { ...roomStateMsg(room), yourToken: player.token, yourSeat: player.seat });
       return;
@@ -154,6 +196,7 @@ function route(ws, msg) {
       }
       const { room, player, reconnected } = manager.joinRoom(msg.code, msg.name, msg.token);
       player.ws = ws;
+      if (typeof msg.playerId === 'string') player.playerId = msg.playerId;
       clients.set(ws, { room, player });
       send(ws, {
         ...roomStateMsg(room),
@@ -170,6 +213,7 @@ function route(ws, msg) {
 
     case 'set_teams': {
       requireSeat(ctx);
+      await requirePremium(ctx.player.playerId || '');
       manager.setTeams(ctx.room, ctx.player, msg.teams);
       broadcast(ctx.room, roomStateMsg(ctx.room));
       return;
@@ -211,8 +255,78 @@ function route(ws, msg) {
   }
 }
 
-const wss = new WebSocketServer({ port: PORT }, () => {
-  console.log(`Raw City Spades server listening on port ${PORT}`);
+/* ---------- REST endpoints (subscriptions) ---------- */
+
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  };
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (c) => {
+      raw += c;
+      if (raw.length > 16 * 1024) { reject(new Error('Body too large')); req.destroy(); }
+    });
+    req.on('end', () => {
+      if (!raw) return resolve({});
+      try { resolve(JSON.parse(raw)); }
+      catch { reject(new Error('Invalid JSON body')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, status, obj) {
+  res.writeHead(status, { 'Content-Type': 'application/json', ...corsHeaders() });
+  res.end(JSON.stringify(obj));
+}
+
+async function handleHttp(req, res) {
+  const url = new URL(req.url, 'http://localhost');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders());
+    return res.end();
+  }
+  try {
+    if (req.method === 'POST' && url.pathname === '/api/create-checkout') {
+      const body = await readJsonBody(req);
+      if (!subs.subscriptionsConfigured()) {
+        return sendJson(res, 503, { error: 'Subscriptions are not configured on this server yet.' });
+      }
+      const checkoutUrl = await subs.createCheckoutSession(body.playerId, body.playerName);
+      return sendJson(res, 200, { url: checkoutUrl });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/verify-session') {
+      const body = await readJsonBody(req);
+      const ok = await subs.verifySession(body.sessionId, body.playerId);
+      return sendJson(res, 200, { subscribed: ok });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/subscription-status') {
+      const ok = await subs.isSubscribed(url.searchParams.get('playerId'));
+      return sendJson(res, 200, { subscribed: ok });
+    }
+    if (req.method === 'GET' && url.pathname === '/') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      return res.end('Blackcity Spades server — connect with a WebSocket client.');
+    }
+    return sendJson(res, 404, { error: 'Not found' });
+  } catch (err) {
+    console.error('HTTP error:', err.message);
+    return sendJson(res, 500, { error: err.message || 'Server error' });
+  }
+}
+
+const httpServer = http.createServer(handleHttp);
+const wss = new WebSocketServer({ server: httpServer });
+
+httpServer.listen(PORT, () => {
+  console.log(`Blackcity Spades server listening on port ${PORT}`);
+  console.log(`Subscriptions ${subs.subscriptionsConfigured() ? 'ENABLED' : 'DISABLED (set STRIPE_SECRET_KEY)'}`);
 });
 
 wss.on('connection', (ws) => {
@@ -226,14 +340,12 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'error', message: 'Invalid JSON' });
       return;
     }
-    try {
-      route(ws, msg);
-    } catch (err) {
+    route(ws, msg).catch((err) => {
       const message = (err instanceof RoomError || err instanceof EngineError)
         ? err.message
         : 'Server error';
       send(ws, { type: 'error', message });
-    }
+    });
   });
 
   ws.on('close', () => {
