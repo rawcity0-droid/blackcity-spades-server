@@ -192,10 +192,9 @@ async function route(ws, msg) {
       }
       const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
       const wantsPrivate = !!(msg.options && msg.options.private);
-      // Premium is required for private tables or any non-default house rules.
-      if (wantsPrivate || !isDefaultOptions({ ...DEFAULT_OPTIONS, ...(msg.options || {}) })) {
-        await requirePremium(playerId);
-      }
+      // Creating a table and sharing its code is a Premium feature — only the
+      // host pays; guests join free with the code.
+      await requirePremium(playerId);
       const { room, player } = manager.createRoom(msg.name, msg.options);
       room.isPrivate = wantsPrivate;
       player.ws = ws;
