@@ -84,6 +84,8 @@ class RoomManager {
       options: validateOptions(options), // validated here; unknown fields ignored
       phase: 'lobby', // lobby -> playing -> hand_done -> match_done
       engine: null,
+      spectators: [], // { name, ws } — watch-only, never see hands
+      tournamentCode: options && options.tournamentCode ? String(options.tournamentCode) : null,
     };
     const player = {
       token: makeToken(),
@@ -120,6 +122,40 @@ class RoomManager {
     };
     room.seats[seat] = player;
     return { room, player, reconnected: false };
+  }
+
+  /** Attach a spectator (watch-only, no seat). Returns spectator record. */
+  addSpectator(code, name) {
+    const room = this.getRoom(code);
+    const spectator = {
+      name: cleanName(name),
+      ws: null, // attached by server.js
+    };
+    room.spectators.push(spectator);
+    return { room, spectator };
+  }
+
+  /** Detach a spectator. */
+  removeSpectator(room, spectator) {
+    const i = room.spectators.indexOf(spectator);
+    if (i >= 0) room.spectators.splice(i, 1);
+  }
+
+  /**
+   * Start a game on a room without requiring a seated host player.
+   * Used by tournament hosts (Premium verified by caller).
+   */
+  forceStartGame(room) {
+    if (room.phase === 'playing' || room.phase === 'bidding') {
+      throw new RoomError('Game already in progress');
+    }
+    const missing = room.seats.findIndex(s => s === null || !s.connected);
+    if (missing >= 0) throw new RoomError('Need 4 connected players to start');
+    if (room.phase === 'lobby' || room.phase === 'match_done') {
+      room.engine = new SpadesEngine(room.teams, room.options);
+    }
+    room.engine.startHand();
+    room.phase = 'playing';
   }
 
   /** Host may set or swap partnerships before the game starts. */
@@ -190,4 +226,143 @@ class RoomManager {
   }
 }
 
-module.exports = { RoomManager, RoomError };
+/*
+ * TournamentManager — groups multiple rooms (tables) into a single event.
+ *
+ * A Premium host creates a tournament with 1-8 tables. Players join with the
+ * tournament code and wait in the lobby; the host seats them (4 per table)
+ * and starts each table's game. Spectators can watch any table.
+ *
+ * Tournament codes use the same 6-character alphabet as room codes, drawn
+ * from the same namespace (a tournament code will never collide with a room
+ * code because both are checked against their own maps — actually we share
+ * the RoomManager's code space by prefixing tournament codes with 'T').
+ */
+class TournamentManager {
+  constructor(roomManager) {
+    this.roomManager = roomManager;
+    this.tournaments = new Map(); // code -> tournament
+  }
+
+  _makeTournamentCode() {
+    let code;
+    do { code = 'T' + makeCode().slice(0, 5); } while (
+      this.tournaments.has(code) || this.roomManager.rooms.has(code));
+    return code;
+  }
+
+  getTournament(code) {
+    const t = this.tournaments.get(String(code || '').toUpperCase());
+    if (!t) throw new RoomError('Tournament not found — check the code');
+    return t;
+  }
+
+  /**
+   * Create a tournament. The host's playerId must be a Premium subscriber
+   * (checked by server.js). Returns { tournament, hostPlayer }.
+   */
+  createTournament(hostName, tableCount, options) {
+    const n = Math.max(1, Math.min(8, Math.floor(Number(tableCount) || 1)));
+    const code = this._makeTournamentCode();
+    const tables = [];
+    for (let i = 0; i < n; i++) {
+      // Host takes seat 0 at table 0; other tables start empty.
+      const { room } = this.roomManager.createRoom(
+        i === 0 ? hostName : `Table ${i + 1}`,
+        { ...(options || {}), tournamentCode: code });
+      // Free the host's auto-seat on non-host tables so players can fill them.
+      if (i !== 0) room.seats[0] = null;
+      tables.push({ tableIndex: i, code: room.code });
+    }
+    const tournament = {
+      code,
+      name: String(hostName || 'Tournament').trim().slice(0, 32) || 'Tournament',
+      tables, // [{ tableIndex, code }]
+      lobby: [], // [{ name, ws }] — waiting to be seated
+      hostName: cleanName(hostName),
+      createdAt: Date.now(),
+    };
+    // Re-seat the host properly at table 0.
+    const table0 = this.roomManager.getRoom(tables[0].code);
+    table0.seats[0].name = cleanName(hostName);
+    this.tournaments.set(code, tournament);
+    return { tournament, hostRoom: table0, hostPlayer: table0.seats[0] };
+  }
+
+  /** A player joins the tournament lobby (not seated yet). */
+  joinLobby(code, name) {
+    const t = this.getTournament(code);
+    const entry = { name: cleanName(name), ws: null };
+    t.lobby.push(entry);
+    return { tournament: t, entry };
+  }
+
+  /** Remove a lobby entry (on disconnect). */
+  leaveLobby(code, entry) {
+    const t = this.tournaments.get(String(code || '').toUpperCase());
+    if (!t || !entry) return;
+    const i = t.lobby.indexOf(entry);
+    if (i >= 0) t.lobby.splice(i, 1);
+  }
+
+  /**
+   * Seat lobby players into tables, 4 per table in join order.
+   * Returns [{ entry, name, tableCode, seat, token }].
+   */
+  seatPlayers(code) {
+    const t = this.getTournament(code);
+    const seated = [];
+    for (const entry of t.lobby) {
+      let placed = false;
+      for (const tbl of t.tables) {
+        const room = this.roomManager.getRoom(tbl.code);
+        if (room.phase !== 'lobby') continue;
+        const seat = room.seats.findIndex(s => s === null);
+        if (seat >= 0) {
+          const player = {
+            token: makeToken(),
+            name: entry.name,
+            seat,
+            connected: false, // they claim it via their token next
+            disconnectTimer: null,
+            ws: null,
+          };
+          room.seats[seat] = player;
+          entry.assigned = { tableCode: room.code, seat, token: player.token };
+          seated.push({ entry, name: entry.name, tableCode: room.code, seat, token: player.token });
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) break; // all tables full
+    }
+    // Remove seated players from the lobby.
+    t.lobby = t.lobby.filter(e => !e.assigned);
+    return seated;
+  }
+
+  /** Snapshot of tournament state for host / lobby views. */
+  tournamentState(code) {
+    const t = this.getTournament(code);
+    return {
+      type: 'tournament_state',
+      tournamentCode: t.code,
+      name: t.name,
+      hostName: t.hostName,
+      lobby: t.lobby.map(e => ({ name: e.name })),
+      tables: t.tables.map(tbl => {
+        const room = this.roomManager.getRoom(tbl.code);
+        return {
+          tableIndex: tbl.tableIndex,
+          code: room.code,
+          phase: room.phase,
+          seats: room.seats.map(p => (p
+            ? { seat: p.seat, name: p.name, connected: p.connected }
+            : null)),
+        };
+      }),
+    };
+  }
+}
+
+module.exports = { RoomManager, RoomError, TournamentManager };
