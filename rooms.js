@@ -354,6 +354,7 @@ class TournamentManager {
     const code = this._makeTournamentCode();
     const rounds = roundNames.map((name, r) => {
       const matchCount = Math.pow(2, roundNames.length - 1 - r);
+      const isFinalRound = r === roundNames.length - 1;
       return {
         name,
         matches: Array.from({ length: matchCount }, (_, m) => ({
@@ -363,6 +364,10 @@ class TournamentManager {
           teamB: null,
           winner: null, // 'A' | 'B'
           status: 'waiting', // waiting | playing | done
+          // Series format: best-of-3 (first to 2) until the final, best-of-5 (first to 3) in the final.
+          seriesWins: { A: 0, B: 0 },
+          seriesTarget: isFinalRound ? 3 : 2,
+          gameNumber: 1,
         })),
       };
     });
@@ -450,45 +455,74 @@ class TournamentManager {
     if (!match || match.status === 'done') {
       return { tournament: t, notifications: [], champion: t.champion };
     }
-    // Pull the winning players (name + live ws) from the finished room.
-    let winners = [];
+    // Pull all players (name + live ws + seat) from the finished room.
+    let allPlayers = [];
     try {
       const room = this.roomManager.getRoom(tableCode);
-      const winSeats = winnerTeam === 0 ? [0, 2] : [1, 3];
-      winners = winSeats.map(s => room.seats[s]).filter(Boolean)
-        .map(p => ({ name: p.name, ws: p.ws }));
+      allPlayers = room.seats
+        .map((p, s) => (p ? { name: p.name, ws: p.ws, seat: s } : null))
+        .filter(Boolean);
     } catch { /* room gone */ }
-    match.status = 'done';
-    match.winner = winnerTeam === 0 ? 'A' : 'B';
+    const winnerSlot = winnerTeam === 0 ? 'A' : 'B';
+    match.seriesWins[winnerSlot]++;
     const notifications = [];
-    const isFinal = roundIndex === t.rounds.length - 1;
-    if (isFinal) {
-      t.champion = winners.map(w => w.name);
-    } else {
-      const m = t.rounds[roundIndex].matches.indexOf(match);
-      const nextMatch = t.rounds[roundIndex + 1].matches[Math.floor(m / 2)];
-      const slot = (m % 2 === 0) ? 'teamA' : 'teamB';
-      nextMatch[slot] = winners.map(w => w.name);
-      // Keep ws refs for seating when the matchup completes.
-      nextMatch[slot + 'Ws'] = winners;
-      if (nextMatch.teamA && nextMatch.teamB) {
-        const nextName = `Bracket ${t.rounds[roundIndex + 1].name} ${Math.floor(m / 2) + 1}`;
-        const { room } = this.roomManager.createRoom(nextName, { tournamentCode: t.code });
-        room.bracketTournamentCode = t.code;
-        room.bracketMatchId = nextMatch.matchId;
-        t.tables.push({ code: room.code });
-        nextMatch.tableCode = room.code;
-        nextMatch.status = 'playing';
-        for (const teamSlot of ['teamA', 'teamB']) {
-          const seats = teamSlot === 'teamA' ? [0, 2] : [1, 3];
-          (nextMatch[teamSlot + 'Ws'] || []).forEach((w, idx) => {
-            const seat = seats[idx];
-            if (seat === undefined) return;
-            const player = this._bracketSeat(w.name, seat);
-            room.seats[seat] = player;
-            notifications.push({ ws: w.ws, name: w.name, tableCode: room.code, seat, token: player.token });
-          });
+    const seriesScore = () => `${match.seriesWins.A}-${match.seriesWins.B}`;
+
+    // Series decided? Advance. Otherwise: rematch with the same teams.
+    if (match.seriesWins[winnerSlot] >= match.seriesTarget) {
+      const winSeats = winnerTeam === 0 ? [0, 2] : [1, 3];
+      const winners = allPlayers.filter(p => winSeats.includes(p.seat));
+      match.status = 'done';
+      match.winner = winnerSlot;
+      const isFinal = roundIndex === t.rounds.length - 1;
+      if (isFinal) {
+        t.champion = winners.map(w => w.name);
+      } else {
+        const m = t.rounds[roundIndex].matches.indexOf(match);
+        const nextMatch = t.rounds[roundIndex + 1].matches[Math.floor(m / 2)];
+        const slot = (m % 2 === 0) ? 'teamA' : 'teamB';
+        nextMatch[slot] = winners.map(w => w.name);
+        nextMatch[slot + 'Ws'] = winners;
+        if (nextMatch.teamA && nextMatch.teamB) {
+          const nextName = `Bracket ${t.rounds[roundIndex + 1].name} ${Math.floor(m / 2) + 1}`;
+          const created = this.roomManager.createRoom(nextName, { tournamentCode: t.code });
+          const room = created.room;
+          room.bracketTournamentCode = t.code;
+          room.bracketMatchId = nextMatch.matchId;
+          t.tables.push({ code: room.code });
+          nextMatch.tableCode = room.code;
+          nextMatch.status = 'playing';
+          for (const teamSlot of ['teamA', 'teamB']) {
+            const seats = teamSlot === 'teamA' ? [0, 2] : [1, 3];
+            (nextMatch[teamSlot + 'Ws'] || []).forEach((w, idx) => {
+              const seat = seats[idx];
+              if (seat === undefined) return;
+              const player = this._bracketSeat(w.name, seat);
+              room.seats[seat] = player;
+              notifications.push({ ws: w.ws, name: w.name, tableCode: room.code,
+                seat, token: player.token, bracketAdvance: true });
+            });
+          }
         }
+      }
+    } else {
+      // Rematch: same teams, fresh table. Series score carries over.
+      match.gameNumber++;
+      const mIdx = t.rounds[roundIndex].matches.indexOf(match);
+      const rematchName = `Bracket ${t.rounds[roundIndex].name} ${mIdx + 1} G${match.gameNumber}`;
+      const created = this.roomManager.createRoom(rematchName, { tournamentCode: t.code });
+      const room = created.room;
+      room.bracketTournamentCode = t.code;
+      room.bracketMatchId = match.matchId;
+      t.tables.push({ code: room.code });
+      match.tableCode = room.code;
+      // match stays 'playing'; winner stays null until series decided
+      for (const p of allPlayers) {
+        const player = this._bracketSeat(p.name, p.seat);
+        room.seats[p.seat] = player;
+        notifications.push({ ws: p.ws, name: p.name, tableCode: room.code,
+          seat: p.seat, token: player.token,
+          rematch: true, gameNumber: match.gameNumber, seriesScore: seriesScore() });
       }
     }
     return { tournament: t, notifications, champion: t.champion };
@@ -518,6 +552,9 @@ class TournamentManager {
           teamB: m.teamB ? m.teamB.slice() : null,
           winner: m.winner,
           status: m.status,
+          seriesWins: m.seriesWins,
+          seriesTarget: m.seriesTarget,
+          gameNumber: m.gameNumber,
         })),
       }));
       base.tables = t.tables.map(tbl => {
