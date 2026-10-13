@@ -235,6 +235,23 @@ async function route(ws, msg) {
       return;
     }
 
+    case 'chat': {
+      // Table talk: seated players can chat back-and-forth. Broadcast to the
+      // table (players + spectators). Ephemeral — no history stored.
+      requireSeat(ctx);
+      const text = typeof msg.text === 'string' ? msg.text.trim().slice(0, 200) : '';
+      if (!text) throw new RoomError('chat needs "text"');
+      const now = Date.now();
+      if (ctx.player.lastChatAt && now - ctx.player.lastChatAt < 2000) {
+        throw new RoomError('Slow down — one message every couple of seconds.');
+      }
+      ctx.player.lastChatAt = now;
+      const chatMsg = { type: 'chat', from: String(ctx.player.name).slice(0, 20), seat: ctx.player.seat, text };
+      broadcast(ctx.room, chatMsg);
+      for (const s of ctx.room.spectators) { if (s.ws) send(s.ws, chatMsg); }
+      return;
+    }
+
     case 'start_game': {
       requireSeat(ctx);
       manager.startGame(ctx.room, ctx.player);
