@@ -114,6 +114,16 @@ function broadcastGameState(room) {
   }
 }
 
+/** Validate a player avatar: small JPEG/PNG/WebP data URL, max ~50KB. */
+function cleanAvatar(v) {
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  if (!s.startsWith('data:image/')) return null;
+  if (s.length > 70000) return null; // ~50KB binary
+  if (!/^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(s)) return null;
+  return s;
+}
+
 function roomStateMsg(room) {
   return {
     type: 'room_state',
@@ -124,7 +134,7 @@ function roomStateMsg(room) {
     options: { ...room.options },
     isPrivate: !!room.isPrivate,
     seats: room.seats.map(p => (p
-      ? { seat: p.seat, name: p.name, connected: p.connected }
+      ? { seat: p.seat, name: p.name, connected: p.connected, avatar: p.avatar || null }
       : null)),
   };
 }
@@ -216,6 +226,7 @@ async function route(ws, msg) {
       }
       const playerId = typeof msg.playerId === 'string' ? msg.playerId : '';
       const wantsPrivate = !!(msg.options && msg.options.private);
+      const avatar = cleanAvatar(msg.avatar);
       // Creating a table and sharing its code is a Premium feature — only the
       // host pays; guests join free with the code.
       await requirePremium(playerId);
@@ -223,6 +234,7 @@ async function route(ws, msg) {
       room.isPrivate = wantsPrivate;
       player.ws = ws;
       player.playerId = playerId;
+      if (avatar) player.avatar = avatar;
       clients.set(ws, { room, player });
       send(ws, { ...roomStateMsg(room), yourToken: player.token, yourSeat: player.seat });
       return;
@@ -237,6 +249,8 @@ async function route(ws, msg) {
       const { room, player, reconnected } = manager.joinRoom(msg.code, msg.name, msg.token);
       player.ws = ws;
       if (typeof msg.playerId === 'string') player.playerId = msg.playerId;
+      const joinAvatar = cleanAvatar(msg.avatar);
+      if (joinAvatar) player.avatar = joinAvatar;
       clients.set(ws, { room, player });
       send(ws, {
         ...roomStateMsg(room),
@@ -364,6 +378,8 @@ async function route(ws, msg) {
       await requirePremium(typeof msg.playerId === 'string' ? msg.playerId : '');
       const { tournament, entry } = tournaments.joinLobby(msg.tournamentCode, msg.name);
       entry.ws = ws;
+      const lobbyAvatar = cleanAvatar(msg.avatar);
+      if (lobbyAvatar) entry.avatar = lobbyAvatar;
       clients.set(ws, { tournament, lobbyEntry: entry });
       send(ws, tournaments.tournamentState(tournament.code));
       // Notify the host's table(s) — broadcast to all seated players in tournament.
@@ -421,6 +437,8 @@ async function route(ws, msg) {
       const { tournament } = tournaments.createBracket(
         msg.name, msg.playerCount, msg.options);
       const entry = { name: String(msg.name).trim().slice(0, 20), ws };
+      const bracketAvatar = cleanAvatar(msg.avatar);
+      if (bracketAvatar) entry.avatar = bracketAvatar;
       tournament.lobby.push(entry);
       clients.set(ws, { tournament, lobbyEntry: entry });
       send(ws, {
