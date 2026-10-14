@@ -47,6 +47,7 @@
 const { WebSocketServer } = require('ws');
 const http = require('http');
 const { RoomManager, RoomError, TournamentManager } = require('./rooms');
+const { chooseBotBid, chooseBotCard } = require('./bots');
 const { EngineError, cardId } = require('./game');
 const subs = require('./subs');
 
@@ -134,7 +135,7 @@ function roomStateMsg(room) {
     options: { ...room.options },
     isPrivate: !!room.isPrivate,
     seats: room.seats.map(p => (p
-      ? { seat: p.seat, name: p.name, connected: p.connected, avatar: p.avatar || null }
+      ? { seat: p.seat, name: p.name, connected: p.connected, avatar: p.avatar || null, isBot: !!p.isBot }
       : null)),
   };
 }
@@ -211,6 +212,36 @@ function handleEngineEvents(room, events) {
   } else if (eng && (room.phase === 'hand_done' || room.phase === 'match_done')) {
     broadcastGameState(room);
   }
+  maybeBotMove(room);
+}
+
+/**
+ * If it's a bot's turn, play for it after a short human-like pause.
+ * Chained: each bot move flows back through handleEngineEvents.
+ */
+function maybeBotMove(room) {
+  const eng = room.engine;
+  if (!eng || room.phase !== 'playing') return;
+  if (eng.phase !== 'bidding' && eng.phase !== 'playing') return;
+  const seat = eng.turn;
+  const p = room.seats[seat];
+  if (!p || !p.isBot) return;
+  const timer = setTimeout(() => {
+    try {
+      if (room.engine !== eng || room.phase !== 'playing') return;
+      if (eng.turn !== seat) return;
+      const now = room.seats[seat];
+      if (!now || !now.isBot) return;
+      let events = null;
+      if (eng.phase === 'bidding') {
+        events = eng.bid(seat, chooseBotBid(eng, seat));
+      } else if (eng.phase === 'playing') {
+        events = eng.playCard(seat, chooseBotCard(eng, seat));
+      }
+      if (events) handleEngineEvents(room, events);
+    } catch (err) { /* a bot hiccup must never crash the table */ }
+  }, 1200 + Math.random() * 1500);
+  if (typeof timer.unref === 'function') timer.unref();
 }
 
 async function route(ws, msg) {
@@ -419,7 +450,7 @@ async function route(ws, msg) {
     case 'leave_table': {
       // Voluntary leave. Frees the seat; tournament tables pull from the waitlist.
       const { room, player } = requireSeat(ctx);
-      const tcode = room.options.tournamentCode;
+      const tcode = room.tournamentCode;
       const { abortedGame } = tournaments.freeSeat(room, player);
       clients.set(ws, {});
       if (abortedGame) {
@@ -684,7 +715,7 @@ wss.on('connection', (ws) => {
             message: `${player.name} timed out — game aborted, room is back in lobby`,
           });
         }
-        const tcode = room.options.tournamentCode;
+        const tcode = room.tournamentCode;
         if (tcode) {
           try {
             const t = tournaments.getTournament(tcode);
