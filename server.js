@@ -755,10 +755,15 @@ httpServer.listen(PORT, () => {
 
 // Keepalive: reap half-open mobile sockets so their delayed 'close' can't
 // nuke a live rejoin (ghost-nuke). Every 25s, ping; terminate sockets that
-// miss their pong.
+// miss 3 pongs in a row (75s of silence). Tolerant of brief mobile stalls.
 const keepalive = setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) { try { ws.terminate(); } catch {} return; }
+    if (ws.isAlive === false) {
+      ws.missedPongs = (ws.missedPongs || 0) + 1;
+    } else {
+      ws.missedPongs = 0;
+    }
+    if (ws.missedPongs >= 3) { try { ws.terminate(); } catch {} return; }
     ws.isAlive = false;
     try { ws.ping(); } catch {}
   });
