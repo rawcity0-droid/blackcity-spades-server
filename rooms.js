@@ -175,13 +175,50 @@ class RoomManager {
     if (room.phase === 'playing' || room.phase === 'bidding') {
       throw new RoomError('Game already in progress');
     }
-    const missing = room.seats.findIndex(s => s === null || !s.connected);
-    if (missing >= 0) throw new RoomError('Need 4 connected players to start');
+    const isTournamentTable = !!room.tournamentCode;
+    const humans = room.seats
+      .map((p, s) => (p && p.connected && !p.isBot ? s : -1))
+      .filter(s => s >= 0);
+    if (isTournamentTable) {
+      // Competitive tables stay human-only.
+      const missing = room.seats.findIndex(s => s === null || !s.connected);
+      if (missing >= 0) throw new RoomError('Need 4 connected players to start');
+    } else {
+      if (humans.length === 0) throw new RoomError('Need at least 1 player to start');
+      this._fillBots(room);
+      // Two humans, default teams -> pair the humans against the bots.
+      if (humans.length === 2 &&
+          JSON.stringify(room.teams) === JSON.stringify([[0, 2], [1, 3]])) {
+        const bots = [0, 1, 2, 3].filter(s => !humans.includes(s));
+        room.teams = [[humans[0], humans[1]], [bots[0], bots[1]]];
+      }
+    }
     if (room.phase === 'lobby' || room.phase === 'match_done') {
       room.engine = new SpadesEngine(room.teams, room.options);
     }
     room.engine.startHand();
     room.phase = 'playing';
+  }
+
+  /** Fill empty seats with computer players (regular tables only). */
+  _fillBots(room) {
+    const used = new Set(room.seats.filter(Boolean).map(p => p.name));
+    const pool = ['Ace', 'Deuce', 'Lucky', 'Rover', 'Joker', 'Chip', 'Sunny', 'Pepper'];
+    for (let s = 0; s < 4; s++) {
+      if (room.seats[s] !== null) continue;
+      const name = pool.find(n => !used.has(n)) || `CPU ${s + 1}`;
+      used.add(name);
+      room.seats[s] = {
+        token: null,
+        name,
+        seat: s,
+        connected: true, // no socket — the server plays for this seat
+        disconnectTimer: null,
+        ws: null,
+        isBot: true,
+        avatar: null,
+      };
+    }
   }
 
   /** Mark a player disconnected; the seat is held 60s for reconnect. */
