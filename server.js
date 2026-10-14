@@ -745,8 +745,22 @@ httpServer.listen(PORT, () => {
   console.log(`Subscriptions ${subs.subscriptionsConfigured() ? 'ENABLED' : 'DISABLED (set STRIPE_SECRET_KEY)'}`);
 });
 
+// Keepalive: reap half-open mobile sockets so their delayed 'close' can't
+// nuke a live rejoin (ghost-nuke). Every 25s, ping; terminate sockets that
+// miss their pong.
+const keepalive = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) { try { ws.terminate(); } catch {} return; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  });
+}, 25000);
+if (typeof keepalive.unref === 'function') keepalive.unref();
+
 wss.on('connection', (ws) => {
   clients.set(ws, { room: null, player: null });
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
     let msg;
@@ -783,6 +797,10 @@ wss.on('connection', (ws) => {
     }
     if (ctx.room && ctx.player) {
       const { room, player } = ctx;
+      // Ghost-nuke guard: if the player already rejoined on a newer socket,
+      // player.ws points there — this closing socket is stale. Skip
+      // markDisconnected so we don't null the live connection.
+      if (player.ws !== ws) return;
       manager.markDisconnected(room, player, ({ abortedGame }) => {
         // 60s hold expired — seat is now free.
         if (abortedGame) {
