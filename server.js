@@ -659,6 +659,49 @@ async function handleHttp(req, res) {
       const ok = await subs.isSubscribed(url.searchParams.get('email'));
       return sendJson(res, 200, { subscribed: ok });
     }
+    if (req.method === 'GET' && url.pathname === '/stats') {
+      // Owner-only live stats dashboard. Open with ?email=<owner email>.
+      if (!subs.isOwner(url.searchParams.get('email'))) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        return res.end('Not authorized.');
+      }
+      let playersOnline = 0, inLobby = 0, inGame = 0, tables = 0, gamesPlaying = 0;
+      for (const room of manager.rooms.values()) {
+        tables++;
+        if (room.phase === 'playing' || room.phase === 'bidding') gamesPlaying++;
+        for (const p of room.seats) {
+          if (p && !p.isBot && p.connected) {
+            playersOnline++;
+            if (room.phase === 'lobby') inLobby++; else inGame++;
+          }
+        }
+        for (const s of (room.spectators || [])) {
+          if (s && s.ws) playersOnline++;
+        }
+      }
+      let tournamentsRunning = 0;
+      for (const t of tournaments.tournaments.values()) {
+        if (!t.finished) tournamentsRunning++;
+      }
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8">` +
+        `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+        `<meta http-equiv="refresh" content="30">` +
+        `<title>Blackcity Spades — Live Stats</title>` +
+        `<style>body{font-family:sans-serif;background:#0f1b2d;color:#fff;margin:0;padding:20px}` +
+        `h1{font-size:22px;color:#e8b93c} .card{background:#1a2a44;border-radius:12px;padding:16px;margin:12px 0}` +
+        `.num{font-size:40px;font-weight:bold;color:#e8b93c} .label{color:#9fb0cc;font-size:14px}` +
+        `.t{color:#9fb0cc;font-size:12px;margin-top:20px}</style></head><body>` +
+        `<h1>♠️ Blackcity Spades — Live</h1>` +
+        `<div class="card"><div class="num">${playersOnline}</div><div class="label">Players online now</div></div>` +
+        `<div class="card"><div class="num">${tables}</div><div class="label">Active tables (${gamesPlaying} games in progress)</div></div>` +
+        `<div class="card"><div class="num">${inLobby}</div><div class="label">Players in lobbies</div></div>` +
+        `<div class="card"><div class="num">${inGame}</div><div class="label">Players in games</div></div>` +
+        `<div class="card"><div class="num">${tournamentsRunning}</div><div class="label">Tournaments running</div></div>` +
+        `<div class="t">Auto-refreshes every 30 seconds. Only visible with the owner email.</div>` +
+        `</body></html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(html);
+    }
     if (req.method === 'GET' && url.pathname === '/') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       return res.end('Blackcity Spades server — connect with a WebSocket client.');
