@@ -278,7 +278,10 @@ async function route(ws, msg) {
       // Guests join free with the host's code — only the host pays Premium.
       const { room, player, reconnected } = manager.joinRoom(msg.code, msg.name, msg.token);
       player.ws = ws;
-      if (typeof msg.playerId === 'string') player.playerId = msg.playerId;
+      // Don't overwrite a valid stored premium email with an empty string
+      // (client Premium is session-only; a rejoin with empty playerId would
+      // wipe the server's copy and break host Premium actions).
+      if (typeof msg.playerId === 'string' && msg.playerId) player.playerId = msg.playerId;
       const joinAvatar = cleanAvatar(msg.avatar);
       if (joinAvatar) player.avatar = joinAvatar;
       clients.set(ws, { room, player });
@@ -311,6 +314,9 @@ async function route(ws, msg) {
 
     case 'set_teams': {
       requireSeat(ctx);
+      // Refresh premium identity from the request (client may have restored
+      // Premium after the seat was claimed; stored copy may be stale/empty).
+      if (typeof msg.playerId === 'string' && msg.playerId) ctx.player.playerId = msg.playerId;
       await requirePremium(ctx.player.playerId || '');
       manager.setTeams(ctx.room, ctx.player, msg.teams);
       broadcast(ctx.room, roomStateMsg(ctx.room));
@@ -320,6 +326,8 @@ async function route(ws, msg) {
     case 'set_options': {
       // Host changes house rules from the lobby (before the game starts).
       requireSeat(ctx);
+      // Refresh premium identity from the request (see set_teams).
+      if (typeof msg.playerId === 'string' && msg.playerId) ctx.player.playerId = msg.playerId;
       await requirePremium(ctx.player.playerId || '');
       const options = manager.setOptions(ctx.room, ctx.player, msg.options);
       broadcast(ctx.room, roomStateMsg(ctx.room));
