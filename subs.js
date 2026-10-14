@@ -186,6 +186,14 @@ async function refreshFromStripe(email, hadRecord) {
 }
 
 /** The authoritative premium check. Fails closed without a key. */
+function isOwner(email) {
+  let em;
+  try { em = cleanEmail(email); } catch { return false; }
+  const owners = String(process.env.OWNER_EMAILS || '').split(',')
+    .map(s => s.trim().toLowerCase()).filter(Boolean);
+  return owners.includes(em);
+}
+
 async function isSubscribed(email) {
   if (process.env.SUBS_BYPASS === '1') return true; // automated tests only
   let em;
@@ -207,6 +215,7 @@ function subscriptionsConfigured() {
 module.exports = {
   createCheckoutSession,
   verifySession,
+  isOwner,
   isSubscribed,
   subscriptionsConfigured,
   PRICE_ID,
