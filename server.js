@@ -291,6 +291,20 @@ async function route(ws, msg) {
       broadcast(room, roomStateMsg(room));
       if (room.phase === 'playing' && room.engine) {
         send(ws, { type: 'game_state', state: room.engine.getView(player.seat) });
+        // Rejoining mid-turn: the rejoin game_state wipes the client's one-shot
+        // turn prompts (legalCards/canBid), and prompts are the only source of
+        // legal cards — so re-send the pending prompt if it's their turn.
+        // Sent only to this socket (never broadcast): per-seat privacy.
+        const eng = room.engine;
+        if (eng.phase === 'bidding' && eng.turn === player.seat) {
+          send(ws, { type: 'bid_prompt', seat: player.seat });
+        } else if (eng.phase === 'playing' && eng.turn === player.seat) {
+          send(ws, {
+            type: 'play_prompt',
+            seat: player.seat,
+            legalCards: eng.legalCards(player.seat).map(cardId),
+          });
+        }
       }
       return;
     }
