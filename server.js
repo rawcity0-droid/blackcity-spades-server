@@ -303,6 +303,16 @@ async function route(ws, msg) {
       return;
     }
 
+    case 'set_options': {
+      // Host changes house rules from the lobby (before the game starts).
+      requireSeat(ctx);
+      await requirePremium(ctx.player.playerId || '');
+      const options = manager.setOptions(ctx.room, ctx.player, msg.options);
+      broadcast(ctx.room, roomStateMsg(ctx.room));
+      send(ctx.ws, { type: 'options_updated', code: ctx.room.code, options });
+      return;
+    }
+
     case 'chat': {
       // Table talk: seated players can chat back-and-forth. Broadcast to the
       // table (players + spectators). Ephemeral — no history stored.
