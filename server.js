@@ -244,8 +244,7 @@ async function route(ws, msg) {
       if (typeof msg.code !== 'string' || typeof msg.name !== 'string') {
         throw new RoomError('join_room needs "code" and "name"');
       }
-      // Online play is Premium-only — free version is vs the computer.
-      await requirePremium(typeof msg.playerId === 'string' ? msg.playerId : '');
+      // Guests join free with the host's code — only the host pays Premium.
       const { room, player, reconnected } = manager.joinRoom(msg.code, msg.name, msg.token);
       player.ws = ws;
       if (typeof msg.playerId === 'string') player.playerId = msg.playerId;
@@ -326,8 +325,7 @@ async function route(ws, msg) {
       if (typeof msg.code !== 'string' || typeof msg.name !== 'string') {
         throw new RoomError('spectate_room needs "code" and "name"');
       }
-      // Watching is a Premium feature.
-      await requirePremium(typeof msg.playerId === 'string' ? msg.playerId : '');
+      // Watching a host's table is free — only the host pays Premium.
       const { room, spectator } = manager.addSpectator(msg.code, msg.name);
       spectator.ws = ws;
       clients.set(ws, { spectatorOf: room, spectator });
@@ -374,8 +372,7 @@ async function route(ws, msg) {
       if (typeof msg.tournamentCode !== 'string' || typeof msg.name !== 'string') {
         throw new RoomError('join_tournament needs "tournamentCode" and "name"');
       }
-      // Tournament play is Premium-only.
-      await requirePremium(typeof msg.playerId === 'string' ? msg.playerId : '');
+      // Guests join the tournament free — only the host pays Premium.
       const { tournament, entry, waitlistEntry, position } = tournaments.joinLobby(msg.tournamentCode, msg.name);
       const myEntry = waitlistEntry || entry;
       myEntry.ws = ws;
