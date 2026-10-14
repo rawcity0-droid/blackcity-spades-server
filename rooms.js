@@ -158,10 +158,12 @@ class RoomManager {
     room.phase = 'playing';
   }
 
-  /** Host may set or swap partnerships before the game starts. */
+  /** Host may set or swap partnerships in the lobby or between hands. */
   setTeams(room, player, teams) {
     this._needHost(room, player);
-    if (room.phase !== 'lobby') throw new RoomError('Teams can only change before the game starts');
+    if (room.phase !== 'lobby' && room.phase !== 'hand_done' && room.phase !== 'match_done') {
+      throw new RoomError('Teams can only change between hands');
+    }
     validateTeamsShape(teams);
     room.teams = teams.map(t => t.slice());
   }
