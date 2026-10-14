@@ -447,6 +447,15 @@ async function route(ws, msg) {
       return;
     }
 
+    case 'add_bots': {
+      // Host fills empty seats with computer players (lobby only).
+      const { room, player } = requireSeat(ctx);
+      const added = manager.addBots(room, player);
+      broadcastAll(room, roomStateMsg(room));
+      send(ws, { type: 'bots_added', code: room.code, added });
+      return;
+    }
+
     case 'leave_table': {
       // Voluntary leave. Frees the seat; tournament tables pull from the waitlist.
       const { room, player } = requireSeat(ctx);
