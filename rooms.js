@@ -200,6 +200,32 @@ class RoomManager {
     room.phase = 'playing';
   }
 
+  /**
+   * Host adds computer players to empty seats (lobby, regular tables only).
+   * Returns the number of bots added.
+   */
+  addBots(room, player) {
+    this._needHost(room, player);
+    if (room.phase === 'playing' || room.phase === 'bidding') {
+      throw new RoomError('Game already in progress');
+    }
+    if (room.tournamentCode) {
+      throw new RoomError('Bots are not allowed in tournament play');
+    }
+    const before = room.seats.filter(s => s !== null).length;
+    this._fillBots(room);
+    // Two humans, default teams -> pair the humans against the bots.
+    const humans = room.seats
+      .map((p, s) => (p && p.connected && !p.isBot ? s : -1))
+      .filter(s => s >= 0);
+    if (humans.length === 2 &&
+        JSON.stringify(room.teams) === JSON.stringify([[0, 2], [1, 3]])) {
+      const bots = [0, 1, 2, 3].filter(s => !humans.includes(s));
+      room.teams = [[humans[0], humans[1]], [bots[0], bots[1]]];
+    }
+    return room.seats.filter(s => s !== null).length - before;
+  }
+
   /** Fill empty seats with computer players (regular tables only). */
   _fillBots(room) {
     const used = new Set(room.seats.filter(Boolean).map(p => p.name));
