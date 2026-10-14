@@ -201,16 +201,15 @@ class RoomManager {
   }
 
   /**
-   * Host adds computer players to empty seats (lobby, regular tables only).
+   * Host adds computer players to empty seats (lobby only).
+   * Works on regular and tournament tables — a solo host can play
+   * a tournament by themselves with bots.
    * Returns the number of bots added.
    */
   addBots(room, player) {
     this._needHost(room, player);
     if (room.phase === 'playing' || room.phase === 'bidding') {
       throw new RoomError('Game already in progress');
-    }
-    if (room.tournamentCode) {
-      throw new RoomError('Bots are not allowed in tournament play');
     }
     const before = room.seats.filter(s => s !== null).length;
     this._fillBots(room);
