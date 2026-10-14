@@ -317,7 +317,8 @@ async function route(ws, msg) {
       // Refresh premium identity from the request (client may have restored
       // Premium after the seat was claimed; stored copy may be stale/empty).
       if (typeof msg.playerId === 'string' && msg.playerId) ctx.player.playerId = msg.playerId;
-      await requirePremium(ctx.player.playerId || '');
+      // No premium re-check here: the host proved Premium when creating the
+      // table (create_room gates on it). manager.setTeams enforces host-only.
       manager.setTeams(ctx.room, ctx.player, msg.teams);
       broadcast(ctx.room, roomStateMsg(ctx.room));
       return;
@@ -328,7 +329,8 @@ async function route(ws, msg) {
       requireSeat(ctx);
       // Refresh premium identity from the request (see set_teams).
       if (typeof msg.playerId === 'string' && msg.playerId) ctx.player.playerId = msg.playerId;
-      await requirePremium(ctx.player.playerId || '');
+      // No premium re-check here: the host proved Premium when creating the
+      // table. manager.setOptions enforces host-only.
       const options = manager.setOptions(ctx.room, ctx.player, msg.options);
       broadcast(ctx.room, roomStateMsg(ctx.room));
       send(ctx.ws, { type: 'options_updated', code: ctx.room.code, options });
