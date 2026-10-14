@@ -167,6 +167,19 @@ class RoomManager {
   }
 
   /**
+   * Host changes house rules in the lobby before the game starts.
+   * Accepts partial options (e.g. { sandbags: false }); unknown fields ignored.
+   * Returns the new validated options.
+   */
+  setOptions(room, player, options) {
+    this._needHost(room, player);
+    if (room.phase !== 'lobby') throw new RoomError('House rules can only change before the game starts');
+    const merged = { ...room.options, ...(options || {}) };
+    room.options = validateOptions(merged);
+    return room.options;
+  }
+
+  /**
    * Host starts the match (lobby -> first hand), the next hand after a
    * completed one, or a fresh match after match_done.
    */
