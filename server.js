@@ -669,6 +669,118 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// Helper: find room and player by code + token for HTTP requests.
+function findHttpPlayer(code, token) {
+  const room = manager.getRoom(code);
+  if (!room) throw new RoomError('Room not found');
+  if (!token) return { room, player: null, seat: -1 };
+  for (let i = 0; i < room.seats.length; i++) {
+    const p = room.seats[i];
+    if (p && p.token === token) return { room, player: p, seat: i };
+  }
+  throw new RoomError('Invalid token');
+}
+
+// Process a game action via HTTP (mirrors WebSocket message handler).
+async function handleHttpAction(action, body) {
+  const code = body.code;
+  const token = body.token;
+  switch (action) {
+    case 'create_room': {
+      if (typeof body.name !== 'string' || !body.name.trim()) {
+        throw new RoomError('create_room needs a "name"');
+      }
+      const playerId = typeof body.playerId === 'string' ? body.playerId : '';
+      await requirePremium(playerId);
+      const { room, player } = manager.createRoom(body.name, body.options);
+      if (body.options && body.options.private) room.isPrivate = true;
+      if (typeof body.playerId === 'string' && body.playerId) player.playerId = body.playerId;
+      const avatar = cleanAvatar(body.avatar);
+      if (avatar) player.avatar = avatar;
+      return { ...roomStateMsg(room), yourToken: player.token, yourSeat: player.seat, code: room.code };
+    }
+    case 'join_room': {
+      if (typeof body.code !== 'string' || typeof body.name !== 'string') {
+        throw new RoomError('join_room needs "code" and "name"');
+      }
+      const { room, player, reconnected } = manager.joinRoom(body.code, body.name, body.token);
+      if (typeof body.playerId === 'string' && body.playerId) player.playerId = body.playerId;
+      const avatar = cleanAvatar(body.avatar);
+      if (avatar) player.avatar = avatar;
+      const result = { ...roomStateMsg(room), yourToken: player.token, yourSeat: player.seat, reconnected };
+      if (room.phase === 'playing' && room.engine) {
+        result.game_state = room.engine.getView(player.seat);
+      }
+      return result;
+    }
+    case 'set_teams': {
+      const { room, player } = findHttpPlayer(code, token);
+      if (!player) throw new RoomError('Not in room');
+      // Host proved Premium at creation; no re-check (matches WebSocket fix).
+      manager.setTeams(room, player, body.teams);
+      return { ...roomStateMsg(room) };
+    }
+    case 'set_options': {
+      const { room, player } = findHttpPlayer(code, token);
+      if (!player) throw new RoomError('Not in room');
+      const options = manager.setOptions(room, player, body.options);
+      return { ...roomStateMsg(room), options };
+    }
+    case 'add_bots': {
+      const { room, player } = findHttpPlayer(code, token);
+      if (!player) throw new RoomError('Not in room');
+      manager.addBots(room, player);
+      return { ...roomStateMsg(room) };
+    }
+    case 'start_game': {
+      const { room, player } = findHttpPlayer(code, token);
+      if (!player) throw new RoomError('Not in room');
+      manager.startGame(room, player);
+      const result = { ...roomStateMsg(room) };
+      if (room.engine) result.game_state = room.engine.getView(player.seat);
+      return result;
+    }
+    case 'bid': {
+      const { room, player, seat } = findHttpPlayer(code, token);
+      if (!player) throw new RoomError('Not in room');
+      if (!room.engine) throw new RoomError('No game in progress');
+      room.engine.bid(seat, body.bid);
+      return { game_state: room.engine.getView(seat), ...roomStateMsg(room) };
+    }
+    case 'play_card': {
+      const { room, player, seat } = findHttpPlayer(code, token);
+      if (!player) throw new RoomError('Not in room');
+      if (!room.engine) throw new RoomError('No game in progress');
+      room.engine.playCard(seat, body.card);
+      return { game_state: room.engine.getView(seat), ...roomStateMsg(room) };
+    }
+    case 'chat': {
+      const { room, player } = findHttpPlayer(code, token);
+      if (!player) throw new RoomError('Not in room');
+      const text = String(body.text || '').slice(0, 200);
+      if (!text.trim()) throw new RoomError('Empty message');
+      // Broadcast via polling: store in room chat history.
+      if (!room.chatHistory) room.chatHistory = [];
+      room.chatHistory.push({ from: player.name, text: text.trim(), ts: Date.now() });
+      if (room.chatHistory.length > 50) room.chatHistory.shift();
+      return { ok: true, ...roomStateMsg(room) };
+    }
+    case 'leave_table': {
+      const { room, player } = findHttpPlayer(code, token);
+      if (player) manager.leaveRoom(room, player);
+      return { ok: true };
+    }
+    case 'spectate_room': {
+      if (typeof body.code !== 'string') throw new RoomError('spectate_room needs "code"');
+      const room = manager.getRoom(body.code);
+      if (!room) throw new RoomError('Room not found');
+      return { ...roomStateMsg(room), spectating: true };
+    }
+    default:
+      throw new RoomError('Unknown action: ' + action);
+  }
+}
+
 async function handleHttp(req, res) {
   const url = new URL(req.url, 'http://localhost');
   if (req.method === 'OPTIONS') {
@@ -692,6 +804,39 @@ async function handleHttp(req, res) {
     if (req.method === 'GET' && url.pathname === '/api/subscription-status') {
       const ok = await subs.isSubscribed(url.searchParams.get('email'));
       return sendJson(res, 200, { subscribed: ok });
+    }
+    // HTTP polling API for clients that can't use WebSocket.
+    // GET /api/state?code=XXX&token=YYY -> current room/game state.
+    if (req.method === 'GET' && url.pathname === '/api/state') {
+      const code = url.searchParams.get('code');
+      const token = url.searchParams.get('token');
+      if (!code) return sendJson(res, 400, { error: 'Missing code' });
+      const room = manager.getRoom(code);
+      if (!room) return sendJson(res, 404, { error: 'Room not found' });
+      let player = null, seat = -1;
+      if (token) {
+        for (let i = 0; i < room.seats.length; i++) {
+          const p = room.seats[i];
+          if (p && p.token === token) { player = p; seat = i; break; }
+        }
+      }
+      const result = { ...roomStateMsg(room) };
+      if (player && room.phase === 'playing' && room.engine) {
+        result.game_state = room.engine.getView(seat);
+      }
+      return sendJson(res, 200, result);
+    }
+    // POST /api/action {action, code, token, ...params} -> process action, return state.
+    if (req.method === 'POST' && url.pathname === '/api/action') {
+      const body = await readJsonBody(req);
+      const action = body.action || body.type;
+      if (!action) return sendJson(res, 400, { error: 'Missing action' });
+      try {
+        const result = await handleHttpAction(action, body);
+        return sendJson(res, 200, result);
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message || 'Action failed' });
+      }
     }
     if (req.method === 'GET' && url.pathname === '/stats') {
       // Owner-only live stats dashboard. Open with ?email=<owner email>.
